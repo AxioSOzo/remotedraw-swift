@@ -1,0 +1,231 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  RemoteDrawSenderKit privacy manifest.
+
+  This is a third-party SDK: everything below becomes part of the *host app's*
+  privacy report, and the host's developer has to defend it to Apple without
+  having read our source. So every entry here is traceable to a named symbol in
+  this package, and nothing is declared "to be safe" — an over-declaration is as
+  wrong as an omission, because it becomes an App Store Connect answer somebody
+  else has to justify about code they did not write.
+
+  Scope: this manifest covers both targets in the package. `RemoteDrawInk` is
+  not separately declarable — it has no manifest of its own and a customer
+  cannot take the renderer without the sender — so its one required-reason API
+  (`RDTrace.measure`, below) is declared here.
+
+  Signature: Apple's manifest-plus-signature requirement applies to SDKs on its
+  commonly-used list. RemoteDrawSenderKit is not on that list, and a source
+  SwiftPM package cannot be signed in any case — signatures apply to binary
+  frameworks. The manifest is required in substance regardless, because the host
+  app's privacy report has to account for what we do.
+
+  What is deliberately NOT here, and why:
+
+  - Camera. Session initiation from a QR code is not in this package: it takes
+    a token as a string and opens no capture device, so it forces no
+    `NSCameraUsageDescription` on the host — the property the README leads with,
+    because it is the difference between a two-hour integration and a two-week
+    one. The surface that arrived in Stage 2 did not change that: the default
+    configuration still forces **zero** Info.plist keys.
+  - Local network / Bonjour. `.nearbyLocalNetwork` is not in this SDK. Shipping
+    an advertiser would cost every host two Info.plist declarations for a
+    broadcast that today's primary receiver — a web page, which cannot do DNS-SD
+    at all — could not hear.
+  - File timestamp, disk space, active keyboard. No code in either target
+    touches them.
+  - Location. There is no CoreLocation import and no authorization request. Map
+    boards get their region from the board's own target metadata, and the map
+    ground stays in the first-party app rather than shipping here.
+  - Crash and performance data. Nothing in this package reports anywhere. The
+    host's own diagnostics SDK declares its own.
+  - Contacts, photos, microphone, health, purchases, search or browsing history,
+    sensitive info. None are read.
+-->
+<plist version="1.0">
+<dict>
+	<!--
+	  No tracking. No IDFA, no ATT prompt, no AppTrackingTransparency import, and
+	  nothing this SDK collects is combined with data from other companies' apps
+	  or sites for advertising or measurement. Confirmed by grep: neither
+	  `advertisingIdentifier` nor `ATTrackingManager` appears in either target,
+	  and the package has zero external dependencies, so there is no transitive
+	  code to account for.
+	-->
+	<key>NSPrivacyTracking</key>
+	<false/>
+
+	<!--
+	  Empty because the only host this SDK contacts is the RemoteDraw API the
+	  integrator configured (`RemoteDrawAPIBaseURL`), which is first-party
+	  service-provider traffic for app functionality. There is no analytics
+	  endpoint, no telemetry collector, and no second origin.
+	-->
+	<key>NSPrivacyTrackingDomains</key>
+	<array/>
+
+	<key>NSPrivacyCollectedDataTypes</key>
+	<array>
+		<!--
+		  Other user content: the drawing itself. Stroke points and their
+		  pressure/tilt channels (`/v1/sender/draft`, `/commit`, `/replace`),
+		  any text annotation, and the phone's projection rectangle.
+
+		  A stroke is whatever the person drew — handwriting, an annotation, a
+		  diagram, a mark on somebody's document — so this is user content, not
+		  usage data, and calling it anything else would understate it.
+
+		  NOT LINKED, and that is a real consequence of the SDK's design rather
+		  than a convenient answer: this SDK authenticates no end user. It holds
+		  a session-scoped `rd_send_…` capability and no account, no email, no
+		  sign-in. There is nothing on our side for the content to be linked
+		  *to*. A host that separately knows who its own user is has linked it in
+		  their own app, and declares that themselves.
+		-->
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeOtherUserContent</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+
+		<!--
+		  Device ID. `RemoteDrawSenderDevice.current()` reads
+		  `UIDevice.current.identifierForVendor` into `SenderDevice.deviceId`,
+		  which rides on `/v1/join`. It is how a board tells one connected phone
+		  from another.
+
+		  OPT-OUT, and the opt-out is a first-class API rather than a documented
+		  workaround: `RemoteDrawSenderDevice.anonymous(aspectRatio:screen:)`
+		  omits the key from the request body entirely — not an empty string, not
+		  a zero UUID — so a host that chooses it collects no identifier at all
+		  and can delete this entry from its own report. A test
+		  (`CaptureTests.testAnAnonymousDeviceSendsGeometryAndNoIdentifier`)
+		  holds that promise to the encoded JSON.
+
+		  Not linked, for the same reason as the content above: no account.
+		-->
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeDeviceID</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+
+		<!--
+		  Other data: the device description the board needs in order to draw
+		  correctly. `RemoteDrawSenderDevice` also carries `platform`,
+		  `appVersion`, `displayName` (`UIDevice.current.name` — the model name,
+		  not a user-chosen one, absent the user-assigned-device-name
+		  entitlement), `modelIdentifier` (`uname`), `aspectRatio`, and a
+		  `RemoteDrawSenderDeviceScreen` of points, scale, pixel dimensions,
+		  safe-area insets and cutout kind.
+
+		  The receiver uses these to place this phone's viewport on the board and
+		  to size the ink. None of it fits one of Apple's named categories, and
+		  it is not diagnostics — it is the geometry the product runs on — so it
+		  lands in Other Data.
+
+		  Also covered here: `RemoteDrawNormalizedPoint.t`, milliseconds since
+		  process start, which feeds stroke velocity. See the boot-time
+		  declaration below for why it is measured the way it is.
+		-->
+		<dict>
+			<key>NSPrivacyCollectedDataType</key>
+			<string>NSPrivacyCollectedDataTypeOtherDataTypes</string>
+			<key>NSPrivacyCollectedDataTypeLinked</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypeTracking</key>
+			<false/>
+			<key>NSPrivacyCollectedDataTypePurposes</key>
+			<array>
+				<string>NSPrivacyCollectedDataTypePurposeAppFunctionality</string>
+			</array>
+		</dict>
+	</array>
+
+	<key>NSPrivacyAccessedAPITypes</key>
+	<array>
+		<!--
+		  User defaults — CA92.1, "access info from same app, per documentation".
+
+		  Added by Stage 2, which is when the first `UserDefaults` access in this
+		  package shipped, exactly as the Stage 1 manifest said it would be.
+		  `RemoteDrawSurface` stores five preferences through `@AppStorage`
+		  (`RemoteDrawPreferences`): handedness, instrument, thickness, colour and
+		  whether shapes fill.
+
+		  CA92.1 and not CA92.5 (app-group) or CA92.4 (managed-app
+		  configuration): every one of these is written by this SDK into the host
+		  app's own defaults domain and read back by this SDK in the same app.
+		  There is no suite name, no app group, and nothing is read that the SDK
+		  did not write.
+
+		  It changes nothing in the collected-data list above. A person's choice
+		  of pencil never leaves the device: it is not transmitted, it is not an
+		  identifier, and it is not combined with anything. A host that would
+		  rather own the storage passes its own bindings and this declaration
+		  still stands, because the surface's own defaults are what it falls back
+		  to.
+		-->
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategoryUserDefaults</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>CA92.1</string>
+			</array>
+		</dict>
+
+		<!--
+		  System boot time — 35F9.1, "measure the amount of time that has elapsed
+		  between events that occurred within the app, or perform calculations to
+		  enable timers."
+
+		  Two uses, in two targets:
+
+		  - `RemoteDrawInkClock` (StrokeTransport.swift), the clock behind
+		    `RemoteDrawNormalizedPoint.t`, which feeds stroke velocity and
+		    therefore ribbon width.
+		  - `RDTrace.measure` (RemoteDrawInk/InkTracing.swift), which times the
+		    paper and tooth rasterisations. Console only; never transmitted.
+
+		  THE SUBTLETY THAT MUST SURVIVE EVERY FUTURE SIMPLIFICATION: `t` *is*
+		  transmitted, and 35F9.1 forbids sending boot time or anything derived
+		  from it off-device — except "information about the amount of time that
+		  has elapsed between events that occurred within the app."
+		  `RemoteDrawInkClock` subtracts a process-start origin precisely so that
+		  every transmitted `t` sits inside that exception. A bare
+		  `ProcessInfo.systemUptime` would not, and would make this declaration a
+		  false statement in every host app that links us.
+
+		  It is not only a privacy constraint. The packed codec quantises this
+		  channel into an `Int32`, and an epoch-scale timestamp overflows it —
+		  which is the defect that killed the first-party app on the first point
+		  of the first stroke. Both reasons point at the same implementation.
+		  Do not change it back to a bare `systemUptime`.
+		-->
+		<dict>
+			<key>NSPrivacyAccessedAPIType</key>
+			<string>NSPrivacyAccessedAPICategorySystemBootTime</string>
+			<key>NSPrivacyAccessedAPITypeReasons</key>
+			<array>
+				<string>35F9.1</string>
+			</array>
+		</dict>
+	</array>
+</dict>
+</plist>
