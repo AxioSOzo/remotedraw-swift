@@ -10,4 +10,4 @@ here is edited in place, and a commit made here is lost on the next release.
   next export. Describe the change in an issue and it gets made upstream, where
   it is covered by the tests that run on every commit.
 
-Generated from `7aa5465` for `0.1.0`.
+Generated from `f695696` for `0.3.0`.

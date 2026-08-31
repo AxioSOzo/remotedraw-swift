@@ -157,15 +157,13 @@ public enum RemoteDrawTouchSampleMatcher {
     in samples: [RemoteDrawTouchSample],
     maxDistance: CGFloat = 64
   ) -> RemoteDrawTouchSample? {
-    var best: (sample: RemoteDrawTouchSample, distance: CGFloat)?
-    for sample in samples {
-      let distance = hypot(sample.location.x - location.x, sample.location.y - location.y)
-      if best == nil || distance < best!.distance {
-        best = (sample, distance)
-      }
+    let distance = { (sample: RemoteDrawTouchSample) -> CGFloat in
+      hypot(sample.location.x - location.x, sample.location.y - location.y)
     }
-    guard let best, best.distance <= maxDistance else { return nil }
-    return best.sample
+    guard let best = samples.min(by: { distance($0) < distance($1) }),
+      distance(best) <= maxDistance
+    else { return nil }
+    return best
   }
 }
 
@@ -199,18 +197,14 @@ public struct RemoteDrawRadialLayout: Equatable, Sendable {
     guard !itemCenters.isEmpty else { return nil }
     let anchorDistance = hypot(location.x - anchor.x, location.y - anchor.y)
     guard anchorDistance >= RemoteDrawRadialMetrics.hubDeadZone else { return nil }
-    var best: (index: Int, distance: CGFloat)?
-    for (index, center) in itemCenters.enumerated() {
-      let distance = hypot(center.x - location.x, center.y - location.y)
-      if best == nil || distance < best!.distance {
-        best = (index, distance)
-      }
+    let distance = { (index: Int) -> CGFloat in
+      hypot(itemCenters[index].x - location.x, itemCenters[index].y - location.y)
     }
     guard
-      let best,
-      best.distance <= RemoteDrawRadialMetrics.itemDiameter / 2 + RemoteDrawRadialMetrics.hitSlop
+      let best = itemCenters.indices.min(by: { distance($0) < distance($1) }),
+      distance(best) <= RemoteDrawRadialMetrics.itemDiameter / 2 + RemoteDrawRadialMetrics.hitSlop
     else { return nil }
-    return best.index
+    return best
   }
 }
 

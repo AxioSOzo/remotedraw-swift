@@ -357,7 +357,7 @@ enum RemoteDrawInk {
   ///
   /// Both fixes are the same move — the blend belongs to the run — and the
   /// ceiling needs no constant, because a film of dye cannot be more than fully
-  /// dyed. `RemoteDrawStrokePainter.withFilm` sets it on the context that
+  /// dyed. `RemoteDrawInkComposer.draw` sets it on the context that
   /// composites the run's layer, which is the placement `hlnative.swift`
   /// measured as the only one that reaches the page.
   struct Film: Equatable {

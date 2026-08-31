@@ -430,6 +430,27 @@ public struct RemoteDrawSession: Decodable, Equatable, Sendable {
   public let status: String
   public let target: RemoteDrawTarget?
   public let capabilities: [String]
+  /// The board this session draws on, when the session belongs to one.
+  public let boardId: String?
+  /// The preset the session was created from, verbatim. Carried, never
+  /// interpreted: preset *copy* stays first-party (see the note above), but a
+  /// host that created the session with a preset is entitled to read back which
+  /// one.
+  public let markupPreset: String?
+  /// Which sender surface the board expects — see
+  /// ``RemoteDrawSenderIntegrationMode``.
+  ///
+  /// Decoded because ignoring it was a silent trap: a customer who created the
+  /// session with `senderIntegrationMode: "streaming"` and pointed this SDK at
+  /// it got no behaviour change at all, and no way to find out why. The surface
+  /// now refuses the board out loud instead. See ``requestsStreaming``.
+  public let senderIntegrationMode: RemoteDrawSenderIntegrationMode?
+  /// The receiver's live screen share, if the board publishes one.
+  ///
+  /// **This SDK cannot consume it.** The field is decoded so the surface can
+  /// say so rather than paint an empty pad — see ``requestsStreaming`` and
+  /// ``RemoteDrawUnsupportedSurface``.
+  public let visualContext: RemoteDrawVisualContext?
   /// Epoch milliseconds. Slides forward while input arrives — see the note on
   /// ``RemoteDrawSenderSession`` about the token *not* sliding with it.
   public let expiresAt: Double?
@@ -448,6 +469,7 @@ public struct RemoteDrawSession: Decodable, Equatable, Sendable {
 
   private enum CodingKeys: String, CodingKey {
     case id, status, target, capabilities, expiresAt, phoneProjection, submission
+    case boardId, markupPreset, senderIntegrationMode, visualContext
   }
 
   public init(from decoder: Decoder) throws {
@@ -456,6 +478,12 @@ public struct RemoteDrawSession: Decodable, Equatable, Sendable {
     status = try container.decodeIfPresent(String.self, forKey: .status) ?? "active"
     target = try? container.decodeIfPresent(RemoteDrawTarget.self, forKey: .target)
     capabilities = try container.decodeIfPresent([String].self, forKey: .capabilities) ?? []
+    boardId = try? container.decodeIfPresent(String.self, forKey: .boardId)
+    markupPreset = try? container.decodeIfPresent(String.self, forKey: .markupPreset)
+    senderIntegrationMode = try? container.decodeIfPresent(
+      RemoteDrawSenderIntegrationMode.self, forKey: .senderIntegrationMode)
+    visualContext = try? container.decodeIfPresent(
+      RemoteDrawVisualContext.self, forKey: .visualContext)
     expiresAt = try container.decodeIfPresent(Double.self, forKey: .expiresAt)
     phoneProjection = try? container.decodeIfPresent(
       RemoteDrawProjection.self, forKey: .phoneProjection)
@@ -471,6 +499,147 @@ public struct RemoteDrawSession: Decodable, Equatable, Sendable {
   /// ``RemoteDrawCapability/submit`` — the grant says whether this sender *may*
   /// submit, this says whether there is anything left to submit to.
   public var acceptsSubmission: Bool { submission?.isSubmitted != true }
+
+  /// Whether this board expects its sender to show the receiver's live pixels.
+  ///
+  /// Either half is enough, because the two say the same thing from opposite
+  /// ends: `senderIntegrationMode == .streaming` is the board asking for a
+  /// streaming sender, and `visualContext.enabled` is the board *publishing*
+  /// the stream a streaming sender would consume. A board that set only one is
+  /// still a board this SDK cannot draw, and answering "no" to half of it is
+  /// how the blank pad happened.
+  public var requestsStreaming: Bool {
+    senderIntegrationMode == .streaming || visualContext?.enabled == true
+  }
+}
+
+/// Which sender surface a board expects.
+///
+/// Forward-decoding, like every other enum on the wire: a mode this build has
+/// never heard of is kept rather than folded into a lookalike.
+public enum RemoteDrawSenderIntegrationMode: Equatable, Sendable, RawRepresentable, Decodable {
+  /// A native sender draws the board itself. What this SDK is.
+  case native
+  /// The sender is expected to show the receiver's screen, live, underneath the
+  /// ink — WebRTC video, which this package deliberately has no dependency for.
+  /// See ``RemoteDrawUnsupportedSurface``.
+  case streaming
+  case other(String)
+
+  public init(rawValue: String) {
+    switch rawValue {
+    case "native": self = .native
+    case "streaming": self = .streaming
+    default: self = .other(rawValue)
+    }
+  }
+
+  public var rawValue: String {
+    switch self {
+    case .native: return "native"
+    case .streaming: return "streaming"
+    case .other(let raw): return raw
+    }
+  }
+
+  public init(from decoder: Decoder) throws {
+    self.init(rawValue: try decoder.singleValueContainer().decode(String.self))
+  }
+}
+
+/// The receiver's live screen share, as the session describes it.
+///
+/// Decoded in full — including the resolved ``iceServers``, which the API
+/// inlines onto the session precisely so a sender learns them without a second
+/// call — even though **this SDK renders none of it**. Two reasons it is here
+/// rather than omitted: a host writing its own consumer (a `WKWebView` on the
+/// hosted `/join` page, or its own WebRTC stack) needs the values, and the
+/// built-in surface needs to know the board wants something it cannot give
+/// before it paints a pad with nothing on it.
+public struct RemoteDrawVisualContext: Decodable, Equatable, Sendable {
+  /// Whether the receiver publishes its pixels for this session.
+  public let enabled: Bool
+  public let maxFps: Int?
+  public let maxLongEdge: Int?
+  /// Regions the receiver blanks before publishing, in normalized board space.
+  public let redact: [RemoteDrawNormalizedBounds]?
+  /// STUN/TURN, already resolved by the API to the deployment's own unless the
+  /// session named its own set.
+  public let iceServers: [RemoteDrawIceServer]?
+
+  private enum CodingKeys: String, CodingKey {
+    case enabled, maxFps, maxLongEdge, redact, iceServers
+  }
+
+  public init(
+    enabled: Bool = false,
+    maxFps: Int? = nil,
+    maxLongEdge: Int? = nil,
+    redact: [RemoteDrawNormalizedBounds]? = nil,
+    iceServers: [RemoteDrawIceServer]? = nil
+  ) {
+    self.enabled = enabled
+    self.maxFps = maxFps
+    self.maxLongEdge = maxLongEdge
+    self.redact = redact
+    self.iceServers = iceServers
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    enabled = ((try? container.decodeIfPresent(Bool.self, forKey: .enabled)) ?? nil) ?? false
+    maxFps = try? container.decodeIfPresent(Int.self, forKey: .maxFps)
+    maxLongEdge = try? container.decodeIfPresent(Int.self, forKey: .maxLongEdge)
+    redact = try? container.decodeIfPresent([RemoteDrawNormalizedBounds].self, forKey: .redact)
+    iceServers = try? container.decodeIfPresent([RemoteDrawIceServer].self, forKey: .iceServers)
+  }
+}
+
+/// A normalized rectangle on the board, `0…1` on both axes.
+public struct RemoteDrawNormalizedBounds: Decodable, Equatable, Sendable {
+  public let x: Double
+  public let y: Double
+  public let width: Double
+  public let height: Double
+
+  public init(x: Double, y: Double, width: Double, height: Double) {
+    self.x = x
+    self.y = y
+    self.width = width
+    self.height = height
+  }
+}
+
+/// One ICE server, in the shape `RTCIceServer` wants.
+///
+/// `urls` is normalized to an array on the way in, because the wire allows both
+/// a single string and a list and a consumer should not have to care which
+/// arrived.
+public struct RemoteDrawIceServer: Decodable, Equatable, Sendable {
+  public let urls: [String]
+  public let username: String?
+  public let credential: String?
+
+  private enum CodingKeys: String, CodingKey {
+    case urls, username, credential
+  }
+
+  public init(urls: [String], username: String? = nil, credential: String? = nil) {
+    self.urls = urls
+    self.username = username
+    self.credential = credential
+  }
+
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    if let single = try? container.decode(String.self, forKey: .urls) {
+      urls = [single]
+    } else {
+      urls = (try? container.decode([String].self, forKey: .urls)) ?? []
+    }
+    username = try? container.decodeIfPresent(String.self, forKey: .username)
+    credential = try? container.decodeIfPresent(String.self, forKey: .credential)
+  }
 }
 
 /// Where a board's submission got to.

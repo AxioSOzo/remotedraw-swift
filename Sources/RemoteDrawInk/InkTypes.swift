@@ -8,13 +8,14 @@ import Foundation
 /// re-exports this module, so a customer writes one `import` and sees these
 /// under the same names.
 ///
-/// The other reason they are here is the one `InkCompatibility.swift` gave in
-/// `apps/ios/RemoteDrawKit`, and it still holds: `InkRenderer.swift` is a
-/// **byte-identical copy** of `apps/ios/RemoteDraw/InkRenderer.swift`
-/// (`diff -q` clean), 2,129 lines of geometry with documented parity to the
-/// web's `inkGeometry.ts`. Editing it to fit a module boundary is the easiest
-/// way to break that parity silently. So the file is copied verbatim and the
-/// two names it reaches for are supplied here.
+/// The other reason they are here is history that still shapes the file.
+/// `InkRenderer.swift` was for a long time a byte-identical copy of the app's
+/// renderer, so the two names it reaches for were supplied alongside it rather
+/// than edited in. That copy is gone — `RemoteDrawInk` is the sole source of
+/// truth and the app compiles this target's source directly — but the renderer
+/// is 2,000-odd lines of geometry with documented parity to the web's
+/// `inkGeometry.ts`, and editing it to fit a module boundary is still the
+/// easiest way to break that parity silently. So these types stay here.
 
 /// A point on the drawing surface, normalized to `0...1` with a top-left
 /// origin, plus whatever the hardware reported about the touch that made it.

@@ -1,8 +1,10 @@
 import Foundation
 import OSLog
 
-/// The two tracing helpers `Ink/InkRenderer.swift` calls, supplied so that file
-/// can stay a byte-identical copy of the iOS app's.
+/// The two tracing helpers `InkRenderer.swift` calls. They were first supplied
+/// so that file could stay a byte-identical copy of the iOS app's; the app's
+/// copy is gone and `RemoteDrawInk` is the sole source of truth, but the
+/// renderer still only needs this small shape.
 ///
 /// The app's versions (`apps/ios/RemoteDraw/Diagnostics.swift`) do more — a
 /// once-only marker, a hang monitor, an uptime-relative clock shared across the

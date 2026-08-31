@@ -6,24 +6,115 @@ Two ways in, and you can stop at either.
 
 **The whole board, in one modifier.** The drawing surface the first-party
 RemoteDraw app shows — paper and its tooth, sixteen instruments, the one-handed
-control cluster, the long-press tool fan, shape snapping — presented full screen
-with a way out:
+control cluster, the long-press tool fan, shape snapping, and a map board's
+geography — presented full screen with a way out:
 
 ```swift
 Button("Draw") { drawing = true }
   .remoteDrawSurface(isPresented: $drawing, senderToken: token) { outcome in
     switch outcome {
-    case .submitted(let receipt): record(receipt)
-    case .left:                   dismissBanner()
-    case .expired:                refreshSession()
-    case .failed(let error):      report(error)
+    case .submitted(let receipt):     record(receipt)
+    case .left:                       dismissBanner()
+    case .expired:                    refreshSession()      // board over, or timed out
+    case .credentialLost:             refreshToken()        // token died, board did not
+    case .unsupportedSurface(let it): open(it.hostedSenderURL)
+    case .failed(let error):          report(error)
     }
   }
 ```
 
+**That is the whole integration.** There is no configure step: `RemoteDraw.shared`
+installs production defaults the first time anything reads it. Call
+`RemoteDraw.configure(_:)` from your `App.init` only to *override* something —
+the API base URL, an anonymous device description, a token provider:
+
+```swift
+@main struct MyApp: App {
+  init() { RemoteDraw.configure(.init(tokenProvider: mintSenderToken)) }
+  …
+}
+```
+
+This used to trap. `RemoteDraw.shared` called `preconditionFailure` when
+`configure` had not run, from inside the modifier's own `.task` — and a trap is
+not an `Error`, so the `catch` beside it could not turn a missing line of setup
+into anything the host could see. It was a crash on the user's tap. If you want
+the strict behaviour back, `try RemoteDraw.requireConfigured()` throws
+`RemoteDrawError.notConfigured` and never auto-configures.
+
 `RemoteDrawSurface` is the same board as a plain `View`, for a host that wants
 it inside its own layout rather than over it; `RemoteDrawTakeover` is that view
 plus the cover, the scene-phase wiring and the exit.
+
+## Map boards, and bringing your own ground
+
+A `kind: "map"` session draws **the geography** behind the ink, from the board's
+own `coordinateSpace.bounds`, through the same board↔geography transform as
+`@remotedraw/geometry` — checked vector by vector against the shared table in
+`Tests/…/Fixtures/mapBoardGeometryVectors.json`. Nothing to wire: the modifier
+above is already a map sender.
+
+Points leave a map board in **board space with no `phoneProjection`**, which is
+the server's native-map contract, and the camera is re-read continuously — so ink
+lands on the geography actually on screen rather than the geography something
+asked for.
+
+Two things worth knowing when you create the session:
+
+- **`coordinateSpace.bounds` is a hard fence, fixed for the life of the
+  session.** No route changes it afterwards. Size it larger than the camera you
+  open on — `RemoteDrawMapBounds.padded(by:)` is the same one-liner as the
+  TypeScript's `padMapBounds`.
+- **Omit it and there is no geography to draw.** The phone shows a flat map tone
+  rather than guessing at a city, which is what the web fallback does.
+
+### `background:` — your own cartography, or your own ground entirely
+
+```swift
+.remoteDrawSurface(isPresented: $drawing, senderToken: token) { ground in
+  MapboxView(bounds: ground.mapBounds)                       // or Google Maps, or a floor plan
+    .onCameraIdle { ground.reportViewport(currentBoardRectangle()) }
+} onOutcome: { outcome in
+  …
+}
+```
+
+**Precedence, highest first:**
+
+1. `background:` — wins on every board kind, and replaces the whole layer. This
+   is how you keep your own basemap instead of Apple's; a customer whose board is
+   a satellite view should not get a street map on the phone.
+2. The built-in MapKit ground — `kind: "map"` with `coordinateSpace.bounds`.
+3. The canvas's own ground — paper, whiteboard or a flat tone, from
+   `RemoteDrawAppearance.ground` or the board's `target.kind`.
+
+A ground that **moves** owes the surface one call:
+`RemoteDrawGroundContext.reportViewport(_:)`, saying which board rectangle it is
+currently showing. Every stroke is re-projected through it. A ground that does
+not move calls nothing and every stroke stays in surface space.
+
+The built-in map is deliberately **not** pannable — every touch belongs to the
+canvas, the way the first-party board ships. Pass your own `MapInteractionModes`
+to `RemoteDrawMapBoardGround`, or supply an interactive map through
+`background:`, if you want the person to move the camera.
+
+## What this SDK will not draw: streaming boards
+
+A session created with `senderIntegrationMode: "streaming"`, or whose receiver
+publishes `visualContext.enabled`, expects the sender to show the receiver's
+screen live under the ink. **This package cannot.** It has no WebRTC, no video
+decoder and no `WKWebView`, by the same decision that keeps its dependency count
+at zero.
+
+It now says so. The surface shows the reason instead of an empty pad, and the
+host is handed `.unsupportedSurface(_:)` carrying a `hostedSenderURL` — the
+hosted `/join` pad, already holding this sender's credential, which *is* an
+implemented streaming consumer. Present it in a `WKWebView` and streaming works
+today.
+
+Previously this SDK did not decode either field, so a customer who asked for
+streaming got **no behaviour change whatsoever** and a white screen with their
+own ink on it.
 
 **Or the headless core** — the wire, not the UI: a session, a capture layer that
 keeps pressure and tilt, a renderer that draws RemoteDraw's ink, and nothing
@@ -32,12 +123,6 @@ that decides what your screen looks like.
 ```swift
 import RemoteDrawSenderKit
 import SwiftUI
-
-@main
-struct MyApp: App {
-  init() { RemoteDraw.configure(.init(apiBaseURL: .production)) }
-  var body: some Scene { WindowGroup { BoardView() } }
-}
 
 struct BoardView: View {
   @StateObject private var model = BoardModel()
@@ -94,7 +179,9 @@ own type.
 | **Idempotency** | Commits are keyed by `clientStrokeId` and submissions by `clientSubmissionId`, so a request lost to a flaky radio is retried rather than duplicated. |
 | **Credential** | A rejected sender token is rotated through `POST /v1/sender/refresh`, which leaves every other sender on the board alone. |
 | **Presence** | A 5 s heartbeat while the surface is up, and a real disconnect on `leave()` — presence is a heartbeat, not a leave signal. |
-| **Ink** | Tapered dynamic ribbons driven by pressure, tilt and velocity. `RemoteDrawInk/InkRenderer.swift` is byte-identical to the first-party app's, so a mark made through this SDK is the same mark. |
+| **Ink** | Tapered dynamic ribbons driven by pressure, tilt and velocity. `RemoteDrawInk` is the one renderer — the first-party app compiles it too — so a mark made through this SDK is the same mark. |
+| **Capture** | Every sample UIKit saw, from `coalescedTouches` — not the one-per-refresh a `DragGesture` reports, which throws away three samples in four on a Pencil. |
+| **Geography** | `RemoteDrawMapGeometry` — the board↔Web-Mercator transform, bit-identical to `@remotedraw/geometry` and pinned to its vectors. |
 
 ## Tokens
 
@@ -110,6 +197,32 @@ Two kinds, and the difference matters:
 `POST /v1/sessions/direct-sender` needs your API key. **Never call it from the
 app.** Mint the token on your server and hand the string to the SDK.
 
+## Outcomes
+
+`RemoteDrawOutcome` is a **closed** enum, so a non-exhaustive `switch` is a
+compiler error rather than a silent path:
+
+| Case | What happened | What to do |
+| --- | --- | --- |
+| `.submitted(RemoteDrawReceipt)` | The drawing was submitted. | Record the receipt. Call `session.submit(metadata:)` yourself if you need the server's own ids — a submit from the SDK's controls reports a placeholder. |
+| `.left` | The person left. Anything drawn is on the board. | Nothing. |
+| `.expired` | The board finished, or the session timed out. | Create a new session. Terminal. |
+| `.credentialLost(RemoteDrawError?)` | The **token** stopped working while the board carried on. | Get a fresh token from `POST /v1/sessions/direct-sender` and present again — or supply `tokenProvider` and the SDK does it before you ever see this. |
+| `.unsupportedSurface(RemoteDrawUnsupportedSurface)` | The board wants something this SDK has no renderer for. | Read `hostedSenderURL`. **The cover stays up** showing the reason — this is a message, not an ending. |
+| `.failed(RemoteDrawError)` | Anything else. | `error.shouldReJoin` and `error.isRetriable` answer what to do next. |
+
+`.credentialLost` was folded into `.expired` and should not have been: one is
+terminal and one is recoverable, and reporting a live board as expired sent
+hosts to create a second session for a board that was still running.
+
+**There is no `.revoked`.** `/v1/join` revokes every other sender on the session,
+so a second device scanning the QR does knock this one off — but the API answers
+a revoked, an unknown and a malformed token with one `invalid_sender_token`, on
+purpose, because the token is the whole credential. Only a genuine expiry of a
+still-wanted token is distinguishable (`sender_token_expired`), and that
+distinction travels in the error attached to `.credentialLost`. Reporting a
+`.revoked` we cannot actually observe would be a guess with a confident name.
+
 ## Capabilities
 
 A session grants what a sender may do. `undo`, `clear`, `submit`,
@@ -123,18 +236,21 @@ a client can never grant itself more than the board allows.
 Three tiers, and the line is drawn at **anything that changes what goes on the
 wire**.
 
-**Values.** `RemoteDrawAppearance` — accent, ink, ground, corner, Dynamic Type
-ceiling, handedness — and `RemoteDrawStrings`, which is every user-facing word
-the surface can say.
+**Values.** `RemoteDrawAppearance` — accent, ink, ground, field guide, corner,
+Dynamic Type ceiling, handedness — and `RemoteDrawStrings`, which is every
+user-facing word the surface can say.
 
 **Two chrome slots.** A header and a footer, and deliberately not a general
 "override any subview" API: slot count is the maintenance budget, and two
 survive a redesign of the middle.
 
+**Bring your own ground.** The `background:` builder above, on both
+`RemoteDrawSurface` and the modifier.
+
 **Bring your own UI.** `RemoteDrawSenderSession` is public, along with
 `RemoteDrawBoardCanvas` (the board's whole paint pass as a placeable `View`),
-`RemoteDrawInkCanvas`, and `RemoteDrawStrokeCapture`. You get correct wire
-behaviour and own everything else.
+`RemoteDrawInkCanvas`, `RemoteDrawStrokeCapture`, `RemoteDrawMapBoardGround` and
+`RemoteDrawMapGeometry`. You get correct wire behaviour and own everything else.
 
 **Not settable, ever:** draft cadence, point budgets, the codec, token storage,
 the sequence counter. Those are protocol, and they are `public let` on the
@@ -185,3 +301,15 @@ with every suite green.
 
 If a vector disagrees with this encoder, that is a divergence between two
 implementations of a wire format. Fix the code, not the fixture.
+
+`Tests/…/Fixtures/mapBoardGeometryVectors.json` is the same idea for the map
+transform, and is a verbatim copy of
+`packages/geometry/tests/fixtures/mapBoardGeometryVectors.json` — copied rather
+than referenced because this package is exported on its own into the public
+mirror, where a path out of it would not resolve. Re-copy it when the shared
+table changes:
+
+```sh
+cp packages/geometry/tests/fixtures/mapBoardGeometryVectors.json \
+   apps/ios/RemoteDrawSenderKit/Tests/RemoteDrawSenderKitTests/Fixtures/
+```

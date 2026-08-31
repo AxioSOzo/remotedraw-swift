@@ -4,10 +4,11 @@ import SwiftUI
 
 /// The public face of `InkRenderer.swift`.
 ///
-/// That file is a byte-identical copy of `apps/ios/RemoteDraw/InkRenderer.swift`
-/// and nearly every declaration in it is internal, because in the app it lives
-/// in the same module as its callers. Making them `public` would be an edit,
-/// and an edit is exactly what the copy exists to avoid. So the handful of
+/// `RemoteDrawInk` is the sole source of truth for the renderer: the first-party
+/// app compiles this target's source directly (see `apps/ios/project.yml`) and
+/// there is no other copy. Nearly every declaration in the renderer is still
+/// internal — its surface is diffed against the web twin as a unit, and its
+/// tests reach the internals through `@testable import` — so the handful of
 /// entry points a sender outside this module needs are re-exported here, one
 /// thin forwarding call each.
 ///
@@ -126,8 +127,8 @@ public enum RemoteDrawGround: Equatable, Sendable {
 /// Publishes the arrival of a rasterised paper or tooth field, so a view that
 /// painted the flat tone redraws with the real one.
 ///
-/// Re-exported from the renderer's own `ToothFieldCache`, which is internal for
-/// the byte-identity reason above. Without an observer the first dry stroke on
+/// Re-exported from the renderer's own `ToothFieldCache`, which stays internal
+/// like the rest of the renderer (see above). Without an observer the first dry stroke on
 /// a fresh board paints unmasked and stays that way until something else
 /// happens to invalidate the view.
 @MainActor

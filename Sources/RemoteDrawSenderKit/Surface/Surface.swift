@@ -7,14 +7,31 @@
   ///
   /// Paper and its tooth, the ink pass with its group ceiling, capture with
   /// pressure and tilt and palm rejection, the one-handed control cluster, the
-  /// long-press tool fan, the controls sheet, text placement, and the board's
-  /// shape-snap offer. Everything the first-party app's board is, minus the two
-  /// things §4 of the design keeps first-party: the MapKit ground and element
-  /// selection.
+  /// long-press tool fan, the controls sheet, text placement, the board's
+  /// shape-snap offer, and — for a `kind: "map"` board — the geography itself.
+  /// Everything the first-party app's board is, minus the one thing §4 of the
+  /// design keeps first-party: element selection.
   ///
   /// ```swift
   /// RemoteDrawSurface(session: session)
   /// ```
+  ///
+  /// ## What is behind the ink
+  ///
+  /// Three answers, in this order:
+  ///
+  /// 1. **`background:`** — whatever the host builds. Wins over everything, on
+  ///    every board kind. This is how a customer keeps their own cartography
+  ///    (Mapbox, Google Maps, a satellite raster) instead of Apple's, or puts
+  ///    the ink over a floor plan the SDK has never heard of. A background that
+  ///    moves reports its board rectangle back through
+  ///    ``RemoteDrawGroundContext/reportViewport``, and the surface re-projects
+  ///    every stroke through it.
+  /// 2. **The built-in MapKit ground** — for a `kind: "map"` board that declared
+  ///    `coordinateSpace.bounds`. Same geography as the first-party app, same
+  ///    board↔geo transform as `@remotedraw/geometry`.
+  /// 3. **The canvas's own ground** — paper, whiteboard or a flat tone, from
+  ///    ``RemoteDrawAppearance/ground`` or the board's `target.kind`.
   ///
   /// ## Embeddable first, takeover second
   ///
@@ -40,6 +57,7 @@
     private let appearance: RemoteDrawAppearance
     private let strings: RemoteDrawStrings
     private let onLeave: (() -> Void)?
+    private let background: ((RemoteDrawGroundContext) -> AnyView)?
 
     // Preferences. `@AppStorage` on the same keys the first-party app has always
     // written, so a person upgrading keeps their instrument.
@@ -64,6 +82,14 @@
     @State private var summon: RemoteDrawRadialSummon?
     @State private var textEntry: TextEntry?
     @State private var isTextTapActive = false
+    @State private var isUndoing = false
+    @State private var visibleError: RemoteDrawError?
+    @State private var lastTextDraftAt = Date.distantPast
+    /// What the ground is currently showing, in board space. ``RemoteDrawBoardViewport/full``
+    /// until something says otherwise, which is the identity mapping and right
+    /// for every ground that does not move.
+    @State private var boardViewport = RemoteDrawBoardViewport.full
+    @State private var hasBoardViewport = false
     @FocusState private var isTextFocused: Bool
 
     private let suppressionDuration: TimeInterval = 0.22
@@ -82,6 +108,34 @@
       self.appearance = appearance
       self.strings = strings
       self.onLeave = onLeave
+      self.background = nil
+    }
+
+    /// The board with a ground of your own behind it.
+    ///
+    /// ```swift
+    /// RemoteDrawSurface(session: session) { ground in
+    ///   MyMapView(bounds: ground.mapBounds)
+    ///     .onCameraChange { ground.reportViewport(myBoardRectangle()) }
+    /// }
+    /// ```
+    ///
+    /// The builder replaces the built-in ground entirely — including the MapKit
+    /// one — for as long as it is supplied. See the type's own documentation for
+    /// the precedence rules, and ``RemoteDrawGroundContext`` for the one thing a
+    /// moving ground owes the surface.
+    public init<Background: View>(
+      session: RemoteDrawSenderSession,
+      appearance: RemoteDrawAppearance = .default,
+      strings: RemoteDrawStrings = .default,
+      onLeave: (() -> Void)? = nil,
+      @ViewBuilder background: @escaping (RemoteDrawGroundContext) -> Background
+    ) {
+      self.session = session
+      self.appearance = appearance
+      self.strings = strings
+      self.onLeave = onLeave
+      self.background = { AnyView(background($0)) }
     }
 
     /// What a drag on this surface is for.
@@ -108,9 +162,12 @@
         GeometryReader { proxy in
           let size = proxy.size
           ZStack {
+            groundLayer(in: size)
+
             RemoteDrawBoardCanvas(
               ground: ground,
               surface: surfaceKind,
+              guide: fieldGuide,
               sections: [RemoteDrawBoardSection(marks: marks)],
               appearance: appearance
             )
@@ -129,6 +186,14 @@
               onTwoFingerTap: undoFromGesture,
               onThreeFingerTap: openControlsFromGesture,
               onPredictedTouches: { predicted = $0 },
+              // The stroke grows from **here**, not from the drag. A
+              // `DragGesture` reports one location per display refresh and
+              // cannot see a `UITouch` at all, so growing the buffer from its
+              // locations threw away three samples in four on a Pencil — 7.7% of
+              // the pixels of a brisk cursive mark, measured at 1:1. The drag
+              // decides what the touch *means*; this channel supplies the
+              // geometry, with the force and attitude already attached.
+              onCoalescedSamples: { appendCoalesced($0, in: size) },
               onLongPressBegan: { summon = RemoteDrawRadialSummon(anchor: $0, location: $0) },
               onLongPressMoved: { summon?.location = $0 },
               onLongPressEnded: { location in
@@ -152,12 +217,22 @@
             RemoteDrawLiveInkGlow(isActive: session.live != nil)
               .frame(width: size.width, height: size.height)
           }
-          .onAppear { ground.prepare(toothExtent: max(size.width, size.height)) }
+          .onAppear {
+            lastSurfaceSize = size
+            ground.prepare(toothExtent: max(size.width, size.height))
+            installStrokeSpace()
+          }
+          .onChange(of: size) { _, next in lastSurfaceSize = next }
           .onChange(of: styleKindRaw) { _, _ in warmTooth(max(size.width, size.height)) }
         }
         .ignoresSafeArea()
 
         controlsOverlay
+        errorBanner
+
+        if let unsupported = unsupportedSurface {
+          RemoteDrawUnsupportedSurfaceView(unsupported: unsupported, onLeave: onLeave)
+        }
       }
       .environment(\.remoteDrawAppearance, resolvedAppearance)
       .environment(\.remoteDrawStrings, strings)
@@ -194,6 +269,9 @@
         Task { await session.markInactive() }
       }
       .onChange(of: session.capabilities) { _, _ in normalizeSelectedTool() }
+      // A host that mounts this view before it has joined gets the board's
+      // geography as soon as the board describes itself, rather than never.
+      .onChange(of: session.session) { _, _ in installStrokeSpace() }
       .onChange(of: selectedTool) { _, tool in
         if tool != .text { commitText() }
       }
@@ -208,6 +286,9 @@
         default:
           break
         }
+      }
+      .onChange(of: session.lastError) { _, error in
+        withAnimation(.easeOut(duration: 0.18)) { visibleError = error }
       }
       .onChange(of: textEntry?.id) { _, id in
         guard id != nil else { return }
@@ -334,12 +415,15 @@
             beginText(at: point)
             return
           }
-          if strokeId == nil {
-            let id = "ios-\(UUID().uuidString)"
-            strokeId = id
-            session.begin(stroke: id, tool: selectedTool, style: style)
+          guard strokeId == nil else {
+            // Nothing else happens here. The samples come from the monitor's
+            // coalesced channel (`appendCoalesced`), which sees every one of
+            // them and the hardware attached to each.
+            return
           }
-          guard selectedTool != .point || session.live?.points.isEmpty != false else { return }
+          let id = "ios-\(UUID().uuidString)"
+          strokeId = id
+          session.begin(stroke: id, tool: selectedTool, style: style)
           session.append([point])
         }
         .onEnded { value in
@@ -387,6 +471,42 @@
       return sample.isPalm
     }
 
+    /// Every sample UIKit saw for the touch that is already drawing.
+    ///
+    /// Gated on there *being* a stroke: this channel fires for any single touch
+    /// on the surface, including the moment before the drag gesture has decided
+    /// what the touch means.
+    private func appendCoalesced(_ samples: [RemoteDrawTouchSample], in size: CGSize) {
+      guard let id = strokeId, session.live?.id == id else { return }
+      guard dragIntent == .drawing || dragIntent == .none else { return }
+      guard !shouldSuppress else { return }
+      // A point is one sample by definition; a text tap places a pin, not ink.
+      guard selectedTool != .point, selectedTool != .text else { return }
+      guard RemoteDrawDrawingSurfaceGeometry.isUsable(size) else { return }
+      let points = samples.filter { !$0.isPalm }.map { normalized($0, in: size) }
+      guard !points.isEmpty else { return }
+      session.append(points)
+    }
+
+    /// A monitor sample as a protocol point.
+    ///
+    /// Unlike ``normalized(_:in:)`` there is nothing to match back: the sample
+    /// *is* the `UITouch`, so its force and attitude arrive with it rather than
+    /// being paired to a drag location by proximity.
+    private func normalized(_ sample: RemoteDrawTouchSample, in size: CGSize)
+      -> RemoteDrawNormalizedPoint
+    {
+      let point = RemoteDrawDrawingSurfaceGeometry.normalizedPoint(for: sample.location, in: size)
+      return RemoteDrawNormalizedPoint(
+        x: RemoteDrawSurfaceGeometry.clamp01(Double(point.x)),
+        y: RemoteDrawSurfaceGeometry.clamp01(Double(point.y)),
+        t: RemoteDrawInkClock.milliseconds,
+        pressure: sample.pressure,
+        tiltX: sample.tiltX,
+        tiltY: sample.tiltY
+      )
+    }
+
     private var shouldSuppress: Bool {
       touches.hasPalmContact || Date() < suppressUntil || dragIntent == .suppressing
     }
@@ -413,7 +533,13 @@
           requiredTravel: cornerControlsTravel,
           maxHorizontalDrift: cornerControlsMaxHorizontalDrift,
           hasBroadEdgeContact: touches.hasBroadEdgeContact,
-          broadContactTravelFactor: 1.6
+          // Broad edge contact is a **thumb**, and a thumb rooted in the corner
+          // is the gesture this affordance is for. It travels a short way, so it
+          // needs *less* distance to count, not more. This shipped at 1.6 — 48pt
+          // of thumb travel — which asked for a stretch most thumbs cannot make
+          // and quietly turned the corner swipe into a stroke. 0.72 is the
+          // first-party board's tuned value; the two now agree.
+          broadContactTravelFactor: 0.72
         ) {
           openControlsFromGesture()
           return false
@@ -445,8 +571,17 @@
       VStack(spacing: 12) {
         Spacer(minLength: 0)
         if session.shapeSuggestion != nil {
-          RemoteDrawShapeSnapPill { Task { try? await session.applyShapeSuggestion() } }
+          RemoteDrawShapeSnapPill(onTap: applyShapeSuggestion)
             .transition(.scale(scale: 0.94).combined(with: .opacity))
+            // Four seconds, the same as the first-party board. An offer about a
+            // stroke made a minute ago is an offer about the wrong stroke, and
+            // the pill sits where a thumb rests.
+            .task(id: session.shapeSuggestion?.id) {
+              let id = session.shapeSuggestion?.id
+              try? await Task.sleep(nanoseconds: 4_000_000_000)
+              guard !Task.isCancelled, session.shapeSuggestion?.id == id else { return }
+              session.dismissShapeSuggestion()
+            }
         }
         HStack {
           if handedness.resolvedSide == .right { Spacer(minLength: 0) }
@@ -454,9 +589,12 @@
             side: handedness.resolvedSide,
             isHidden: session.live != nil && textEntry == nil,
             showsUndo: session.capabilities.contains(.undo),
+            // While one is in flight. A second tap before the first answers
+            // undoes two strokes for one gesture.
+            isUndoDisabled: isUndoing,
             toolSystemImage: styleKind.systemImage,
             textComposer: textComposer,
-            onUndo: { Task { try? await session.undo() } },
+            onUndo: { Task { await undo() } },
             onOpenControls: { isControlsPresented = true }
           )
           if handedness.resolvedSide == .left { Spacer(minLength: 0) }
@@ -481,7 +619,7 @@
         items.append(
           RemoteDrawRadialMenuItem(
             id: "undo", systemImage: "arrow.uturn.backward", title: strings.undo,
-            action: { Task { try? await session.undo() } }))
+            action: { Task { await undo() } }))
       }
       // Deliberately no destructive item: `clear` is one release of a finger
       // away from every other item on the fan, and it cannot be undone into
@@ -494,7 +632,22 @@
       dragIntent = .suppressing
       cancelStroke()
       UIImpactFeedbackGenerator(style: .light).impactOccurred()
-      Task { try? await session.undo() }
+      Task { await undo() }
+    }
+
+    private func undo() async {
+      guard !isUndoing else { return }
+      isUndoing = true
+      defer { isUndoing = false }
+      _ = try? await session.undo()
+    }
+
+    /// Accepting the board's offer is a decision, so it gets the same light
+    /// impact the first-party board gives it — a straightened shape that
+    /// appears with no confirmation reads as a glitch.
+    private func applyShapeSuggestion() {
+      UIImpactFeedbackGenerator(style: .light).impactOccurred()
+      Task { try? await session.applyShapeSuggestion() }
     }
 
     private func openControlsFromGesture() {
@@ -513,7 +666,155 @@
       }
     }
 
+    // MARK: Ground
+
+    /// Whatever goes behind the ink. See the precedence note on
+    /// ``RemoteDrawSurface``.
+    @ViewBuilder
+    private func groundLayer(in size: CGSize) -> some View {
+      if let background {
+        background(groundContext(in: size))
+          .frame(width: size.width, height: size.height)
+          .clipped()
+      } else if let bounds = mapBounds {
+        #if canImport(MapKit)
+          RemoteDrawMapBoardGround(
+            bounds: bounds,
+            projection: session.session?.phoneProjection,
+            onViewportChange: adoptViewport
+          )
+          .frame(width: size.width, height: size.height)
+        #else
+          RemoteDrawSurface.mapFallbackTone
+        #endif
+      } else if isMapBoard {
+        // A map board that declared no `coordinateSpace.bounds` has no
+        // geography anyone can name — the web falls back to Manhattan, which is
+        // worse than admitting it. Draw the tone a map would have had rather
+        // than the white the transparent ground leaves.
+        RemoteDrawSurface.mapFallbackTone
+      }
+    }
+
+    /// The tone under ink when a map board has no fence to draw.
+    static let mapFallbackTone = Color(red: 0.86, green: 0.91, blue: 0.87)
+
+    private func groundContext(in size: CGSize) -> RemoteDrawGroundContext {
+      RemoteDrawGroundContext(
+        session: session.session,
+        mapBounds: mapBounds,
+        phoneProjection: session.session?.phoneProjection,
+        size: size,
+        reportViewport: adoptViewport
+      )
+    }
+
+    private var isMapBoard: Bool { session.session?.target?.kind == "map" }
+
+    /// The board's geographic fence, on a map board that declared one.
+    private var mapBounds: RemoteDrawMapBounds? {
+      guard isMapBoard else { return nil }
+      guard let bounds = RemoteDrawMapBounds(target: session.session?.target),
+        !bounds.isDegenerate
+      else { return nil }
+      return bounds
+    }
+
+    /// Adopt what the ground says it is showing, and re-project through it.
+    ///
+    /// Re-installed rather than read live, because the SDK calls the space from
+    /// a `@Sendable` context and a closure that reached back into this view
+    /// would be reading a copy SwiftUI has since thrown away.
+    private func adoptViewport(_ viewport: RemoteDrawBoardViewport) {
+      guard !hasBoardViewport || !boardViewport.isClose(to: viewport) else { return }
+      boardViewport = viewport
+      hasBoardViewport = true
+      installStrokeSpace()
+    }
+
+    /// Points leave this surface in board space **only** when something behind
+    /// the ink has claimed a rectangle of it. Every other board keeps the
+    /// Stage 1 behaviour, untouched.
+    private func installStrokeSpace() {
+      guard hasBoardViewport || mapBounds != nil else { return }
+      let viewport = boardViewport
+      session.strokeSpace = { .map(viewport: viewport) }
+    }
+
+    /// Field furniture: the host's choice, else the board's own preset, else
+    /// nothing.
+    private var fieldGuide: RemoteDrawFieldGuide {
+      if let declared = appearance.fieldGuide { return declared }
+      // The geography is the field on a map board; furniture over it is clutter.
+      guard !isMapBoard else { return .none }
+      switch session.session?.markupPreset {
+      case "approval": return .approvalBox
+      case "pointer": return .pointerCrosshair
+      default: return .none
+      }
+    }
+
+    // MARK: Boards this SDK cannot draw
+
+    /// Set when the board asked for something this package has no renderer for.
+    ///
+    /// Today that is exactly one thing: a session that wants the receiver's
+    /// pixels streamed under the ink. This SDK has no WebRTC, no video decoder
+    /// and no `WKWebView`, by the same decision that keeps its dependency count
+    /// at zero — so it says so, loudly, instead of painting an empty pad and
+    /// letting the customer guess.
+    private var unsupportedSurface: RemoteDrawUnsupportedSurface? {
+      guard session.session?.requestsStreaming == true else { return nil }
+      return .streaming(senderToken: session.senderToken)
+    }
+
+    // MARK: Failures
+
+    /// The last thing that went wrong, shown rather than swallowed.
+    ///
+    /// ``RemoteDrawSenderSession/lastError`` was published from the first
+    /// release and read by nothing: every control in this surface routes its
+    /// failure into it and then discards the throw, so a failed undo, commit or
+    /// submit was completely invisible in the built-in UI.
+    @ViewBuilder
+    private var errorBanner: some View {
+      if let error = visibleError {
+        VStack {
+          Text(error.errorDescription ?? "Something went wrong.")
+            .font(.system(size: 13, weight: .semibold))
+            .foregroundStyle(.white)
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .background(
+              Capsule().fill(Color(red: 0.55, green: 0.16, blue: 0.13).opacity(0.94)))
+            .padding(.top, 14)
+          Spacer(minLength: 0)
+        }
+        .allowsHitTesting(false)
+        .transition(.move(edge: .top).combined(with: .opacity))
+        // Four seconds and gone. `lastError` is cleared by the next *successful*
+        // call, which on a board nobody is drawing on may be never — a red bar
+        // that outlives the failure it describes is chrome, not information.
+        .task(id: error) {
+          try? await Task.sleep(nanoseconds: 4_000_000_000)
+          guard !Task.isCancelled else { return }
+          visibleError = nil
+        }
+      }
+    }
+
     // MARK: Text
+
+    /// The board's own ceiling for a caption. A pin is a label, not a document,
+    /// and 280 is what the first-party board enforces.
+    private static let maximumTextLength = 280
+    /// One text draft per draft frame, not one per keystroke.
+    ///
+    /// Placing a caption has no stroke buffer behind it, so nothing else paces
+    /// it: every character typed was its own request, spending the sender's
+    /// rate-limit budget on frames nobody can read.
+    private static let textDraftInterval = RemoteDrawProtocolLimits.draftSendInterval
 
     private var textComposer: RemoteDrawTextComposerConfiguration? {
       guard textEntry != nil else { return nil }
@@ -521,9 +822,14 @@
         text: Binding(
           get: { textEntry?.text ?? "" },
           set: { next in
-            textEntry?.text = next
+            let clamped = String(next.prefix(RemoteDrawSurface.maximumTextLength))
+            textEntry?.text = clamped
             guard let entry = textEntry else { return }
-            Task { await session.draftText(next, at: entry.surfacePoint) }
+            let now = Date()
+            guard now.timeIntervalSince(lastTextDraftAt) >= RemoteDrawSurface.textDraftInterval
+            else { return }
+            lastTextDraftAt = now
+            Task { await session.draftText(clamped, at: entry.surfacePoint) }
           }
         ),
         focus: $isTextFocused,
@@ -542,6 +848,7 @@
       guard let entry = textEntry else { return }
       textEntry = nil
       isTextFocused = false
+      lastTextDraftAt = .distantPast
       Task { try? await session.commitText(entry.text, at: entry.surfacePoint, style: style) }
     }
 

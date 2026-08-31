@@ -10,6 +10,18 @@
 import SwiftUI
 import UIKit
 
+/// How far past the surface's edge a touch still counts as being on it: a
+/// finger that lands a hair outside the bounds is drawing, not dismissing.
+private let touchBoundsSlop: CGFloat = 12
+
+/// Whether `touch` is on `boundsView`, within ``touchBoundsSlop``. No bounds
+/// view means nothing to be outside of.
+private func touchIsInsideBounds(_ touch: UITouch, of boundsView: UIView?) -> Bool {
+  guard let boundsView else { return true }
+  let location = touch.location(in: boundsView)
+  return boundsView.bounds.insetBy(dx: -touchBoundsSlop, dy: -touchBoundsSlop).contains(location)
+}
+
 public struct RemoteDrawTouchSnapshot: Equatable, Sendable {
   /// Active touches with classification; palms are kept (they matter for
   /// matching) but excluded from `activeTouchCount`.
@@ -322,14 +334,8 @@ public struct RemoteDrawGestureInstaller: UIViewRepresentable {
       return boundsView.bounds.contains(recognizer.location(in: boundsView))
     }
 
-    fileprivate func touchIsInsideBounds(_ touch: UITouch) -> Bool {
-      guard let boundsView else { return true }
-      let location = touch.location(in: boundsView)
-      return boundsView.bounds.insetBy(dx: -12, dy: -12).contains(location)
-    }
-
     public func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
-      guard touchIsInsideBounds(touch) else { return false }
+      guard touchIsInsideBounds(touch, of: boundsView) else { return false }
       if gestureRecognizer === longPress {
         // Pencil users rest the tip while thinking; never summon for pencil.
         guard touch.type != .pencil else { return false }
@@ -485,7 +491,7 @@ final class RemoteDrawTouchMonitorRecognizer: UIGestureRecognizer {
       let isFinishing = touch.phase == .ended || touch.phase == .cancelled
       return (includingEnding || !isFinishing)
         && touch.phase != .cancelled
-        && touchIsInsideBounds(touch)
+        && touchIsInsideBounds(touch, of: boundsView)
         && !(touch.type == .direct && RemoteDrawTouchClassifier.isPalm(majorRadius: touch.majorRadius))
     }
     guard drawing.count == 1 else { return nil }
@@ -509,7 +515,7 @@ final class RemoteDrawTouchMonitorRecognizer: UIGestureRecognizer {
     let activeTouches: [UITouch] = allTouches.filter { touch in
       touch.phase != .ended
         && touch.phase != .cancelled
-        && touchIsInsideBounds(touch)
+        && touchIsInsideBounds(touch, of: boundsView)
     }
     var samples: [RemoteDrawTouchSample] = []
     samples.reserveCapacity(activeTouches.count)
@@ -562,12 +568,6 @@ final class RemoteDrawTouchMonitorRecognizer: UIGestureRecognizer {
     guard snapshot != lastSnapshot else { return }
     lastSnapshot = snapshot
     onSnapshot?(snapshot)
-  }
-
-  private func touchIsInsideBounds(_ touch: UITouch) -> Bool {
-    guard let boundsView else { return true }
-    let location = touch.location(in: boundsView)
-    return boundsView.bounds.insetBy(dx: -12, dy: -12).contains(location)
   }
 
   private func isBroadEdgeContact(_ touch: UITouch) -> Bool {

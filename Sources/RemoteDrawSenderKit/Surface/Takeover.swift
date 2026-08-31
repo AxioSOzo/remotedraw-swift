@@ -14,7 +14,42 @@
     /// submitted.
     case left
     /// The board finished, or the session timed out, while the surface was up.
+    ///
+    /// Both are terminal and both call for the same recovery — a new session
+    /// from your backend — which is why they are one case. What used to be
+    /// folded in here and is **not** any more is ``credentialLost``: that one is
+    /// recoverable, and reporting it as an expiry sent hosts to create a new
+    /// session for a board that was still running.
     case expired
+    /// The sender's credential stopped working while the board carried on.
+    ///
+    /// A sender token's expiry is pinned to the session's expiry **at join
+    /// time** and never patched, while the session's own expiry slides forward
+    /// while someone draws — so a long board outlives its credential. It is also
+    /// what happens when the token is revoked: `/v1/join` revokes every other
+    /// active sender on the session, so a second device scanning the QR knocks
+    /// this one off.
+    ///
+    /// **The wire cannot tell those two apart.** `convex/lib/auth.ts` answers a
+    /// malformed, an unknown and a *revoked* token with one
+    /// `invalid_sender_token`, on purpose — the token is the whole credential —
+    /// and only a genuine expiry of a still-wanted token gets its own
+    /// `sender_token_expired`. The distinguishable half travels in the
+    /// associated error; there is no honest `.revoked` to report.
+    ///
+    /// Recover by asking your backend for a fresh token
+    /// (`POST /v1/sessions/direct-sender`) and presenting the surface again.
+    /// Supply ``RemoteDrawConfiguration/tokenProvider`` and the SDK does it for
+    /// you before this is ever reported.
+    case credentialLost(RemoteDrawError?)
+    /// The board asked for something this SDK has no renderer for.
+    ///
+    /// Reported **without dismissing the surface**, which stays up showing the
+    /// reason: a cover that closes itself with no explanation is the white
+    /// screen again, one step earlier. Read
+    /// ``RemoteDrawUnsupportedSurface/hostedSenderURL`` to hand the person the
+    /// hosted pad, which can do what this one cannot.
+    case unsupportedSurface(RemoteDrawUnsupportedSurface)
     case failed(RemoteDrawError)
   }
 
@@ -71,11 +106,13 @@
     private let appearance: RemoteDrawAppearance
     private let strings: RemoteDrawStrings
     private let exit: RemoteDrawExit
+    private let background: ((RemoteDrawGroundContext) -> AnyView)?
     private let onOutcome: (RemoteDrawOutcome) -> Void
 
     @Environment(\.scenePhase) private var scenePhase
     @State private var isConfirmingExit = false
     @State private var hasReportedOutcome = false
+    @State private var hasReportedUnsupported = false
 
     public init(
       session: RemoteDrawSenderSession,
@@ -88,17 +125,46 @@
       self.appearance = appearance
       self.strings = strings
       self.exit = exit
+      self.background = nil
+      self.onOutcome = onOutcome
+    }
+
+    /// The takeover with a ground of your own behind the ink. See
+    /// ``RemoteDrawGroundContext``.
+    public init<Background: View>(
+      session: RemoteDrawSenderSession,
+      appearance: RemoteDrawAppearance = .default,
+      strings: RemoteDrawStrings = .default,
+      exit: RemoteDrawExit = .default,
+      onOutcome: @escaping (RemoteDrawOutcome) -> Void = { _ in },
+      @ViewBuilder background: @escaping (RemoteDrawGroundContext) -> Background
+    ) {
+      self.session = session
+      self.appearance = appearance
+      self.strings = strings
+      self.exit = exit
+      self.background = { AnyView(background($0)) }
       self.onOutcome = onOutcome
     }
 
     public var body: some View {
       ZStack(alignment: .topLeading) {
-        RemoteDrawSurface(
-          session: session,
-          appearance: appearance,
-          strings: strings,
-          onLeave: exit.showsInControls ? requestExit : nil
-        )
+        if let background {
+          RemoteDrawSurface(
+            session: session,
+            appearance: appearance,
+            strings: strings,
+            onLeave: exit.showsInControls ? requestExit : nil,
+            background: background
+          )
+        } else {
+          RemoteDrawSurface(
+            session: session,
+            appearance: appearance,
+            strings: strings,
+            onLeave: exit.showsInControls ? requestExit : nil
+          )
+        }
 
         closeControl
       }
@@ -127,14 +193,40 @@
         switch phase {
         case .submitted:
           report(.submitted(RemoteDrawReceipt.placeholder))
-        case .ended(.ended), .ended(.tokenLost):
+        case .ended(.ended):
           report(.expired)
+        case .ended(.tokenLost):
+          // Not an expiry. The board may still be running; the credential is
+          // what stopped. `lastError` carries whichever of the two the wire was
+          // able to distinguish — see ``RemoteDrawOutcome/credentialLost(_:)``.
+          report(.credentialLost(session.lastError))
         case .ended(.failed(let message)):
           report(.failed(.transport(message)))
         default:
           break
         }
       }
+      .onChange(of: unsupportedSurface) { _, unsupported in
+        reportUnsupported(unsupported)
+      }
+      .onAppear { reportUnsupported(unsupportedSurface) }
+    }
+
+    /// The board asking for something this SDK cannot draw, if it is.
+    ///
+    /// Read from the session rather than from the surface so a host using the
+    /// one-liner is told even though the surface is the thing showing it.
+    private var unsupportedSurface: RemoteDrawUnsupportedSurface? {
+      guard session.session?.requestsStreaming == true else { return nil }
+      return .streaming(senderToken: session.senderToken)
+    }
+
+    /// Reported once, and **without latching the terminal outcome**: the person
+    /// can still leave, and that leave is still a `.left`.
+    private func reportUnsupported(_ unsupported: RemoteDrawUnsupportedSurface?) {
+      guard let unsupported, !hasReportedUnsupported, !hasReportedOutcome else { return }
+      hasReportedUnsupported = true
+      onOutcome(.unsupportedSurface(unsupported))
     }
 
     /// Always present, never configurable. See ``RemoteDrawExit/showsInControls``.
@@ -205,13 +297,20 @@
     /// Button("Draw") { drawing = true }
     ///   .remoteDrawSurface(isPresented: $drawing, senderToken: token) { outcome in
     ///     switch outcome {
-    ///     case .submitted(let receipt):  record(receipt)
-    ///     case .left:                    dismissBanner()
-    ///     case .expired:                 refreshSession()
-    ///     case .failed(let error):       report(error)
+    ///     case .submitted(let receipt):     record(receipt)
+    ///     case .left:                       dismissBanner()
+    ///     case .expired:                    refreshSession()
+    ///     case .credentialLost:             refreshToken()
+    ///     case .unsupportedSurface(let it): open(it.hostedSenderURL)
+    ///     case .failed(let error):          report(error)
     ///     }
     ///   }
     /// ```
+    ///
+    /// **There is nothing to configure first.** ``RemoteDraw/shared`` installs
+    /// production defaults on first use, so this line is the whole integration.
+    /// Call ``RemoteDraw/configure(_:)`` from your `App.init` only to change the
+    /// base URL, the device description or the token provider.
     ///
     /// `senderToken` is an `rd_send_…` from your backend's
     /// `POST /v1/sessions/direct-sender`. A join token works too — it is
@@ -233,6 +332,50 @@
           appearance: appearance,
           strings: strings,
           exit: exit,
+          background: nil,
+          onOutcome: onOutcome
+        ))
+    }
+
+    /// The same one-liner, with your own ground behind the ink.
+    ///
+    /// ```swift
+    /// .remoteDrawSurface(isPresented: $drawing, senderToken: token) { ground in
+    ///   MapboxView(bounds: ground.mapBounds)
+    ///     .onCameraIdle { ground.reportViewport(currentBoardRectangle()) }
+    /// } onOutcome: { outcome in
+    ///   …
+    /// }
+    /// ```
+    ///
+    /// ## Precedence
+    ///
+    /// This builder wins over everything. Omit it and a `kind: "map"` board with
+    /// `coordinateSpace.bounds` gets the built-in MapKit ground; omit it on any
+    /// other board and the canvas paints its own paper, whiteboard or flat tone.
+    /// The builder is never *merged* with the built-in ground — a host that
+    /// supplies one owns the whole layer, which is the only way "keep my own
+    /// cartography" can mean anything.
+    ///
+    /// A ground that moves must call ``RemoteDrawGroundContext/reportViewport``.
+    /// A static one calls nothing and every stroke stays in surface space.
+    public func remoteDrawSurface<Background: View>(
+      isPresented: Binding<Bool>,
+      senderToken: String,
+      appearance: RemoteDrawAppearance = .default,
+      strings: RemoteDrawStrings = .default,
+      exit: RemoteDrawExit = .default,
+      @ViewBuilder background: @escaping (RemoteDrawGroundContext) -> Background,
+      onOutcome: @escaping (RemoteDrawOutcome) -> Void = { _ in }
+    ) -> some View {
+      modifier(
+        RemoteDrawSurfaceModifier(
+          isPresented: isPresented,
+          senderToken: senderToken,
+          appearance: appearance,
+          strings: strings,
+          exit: exit,
+          background: { AnyView(background($0)) },
           onOutcome: onOutcome
         ))
     }
@@ -244,25 +387,45 @@
     let appearance: RemoteDrawAppearance
     let strings: RemoteDrawStrings
     let exit: RemoteDrawExit
+    let background: ((RemoteDrawGroundContext) -> AnyView)?
     let onOutcome: (RemoteDrawOutcome) -> Void
 
     @State private var session: RemoteDrawSenderSession?
     @State private var failure: RemoteDrawError?
 
+    /// A takeover outcome closes the cover — except the one that is a message
+    /// rather than an ending. See ``RemoteDrawOutcome/unsupportedSurface(_:)``.
+    private func handle(_ outcome: RemoteDrawOutcome) {
+      if case .unsupportedSurface = outcome {
+        onOutcome(outcome)
+        return
+      }
+      isPresented = false
+      onOutcome(outcome)
+    }
+
     func body(content: Content) -> some View {
       content.fullScreenCover(isPresented: $isPresented) {
         Group {
           if let session {
-            RemoteDrawTakeover(
-              session: session,
-              appearance: appearance,
-              strings: strings,
-              exit: exit,
-              onOutcome: { outcome in
-                isPresented = false
-                onOutcome(outcome)
-              }
-            )
+            if let background {
+              RemoteDrawTakeover(
+                session: session,
+                appearance: appearance,
+                strings: strings,
+                exit: exit,
+                onOutcome: handle,
+                background: background
+              )
+            } else {
+              RemoteDrawTakeover(
+                session: session,
+                appearance: appearance,
+                strings: strings,
+                exit: exit,
+                onOutcome: handle
+              )
+            }
           } else {
             RemoteDrawConnectingView(
               failure: failure,
@@ -276,7 +439,15 @@
         .interactiveDismissDisabled(!exit.allowsInteractiveDismiss)
         .task {
           guard session == nil else { return }
+          // Cleared on the way in: re-presenting after a failure used to show
+          // the old error next to a spinner for the retry already in flight.
+          failure = nil
           do {
+            // `RemoteDraw.shared` configures itself against production if the
+            // host never called `configure(_:)`. It used to trap here instead —
+            // and a `preconditionFailure` is not an `Error`, so the `catch`
+            // below could never turn it into an outcome. The customer got a
+            // crash on their user's tap.
             session = try await RemoteDraw.shared.join(rawToken: senderToken)
           } catch {
             failure = (error as? RemoteDrawError) ?? .transport(error.localizedDescription)

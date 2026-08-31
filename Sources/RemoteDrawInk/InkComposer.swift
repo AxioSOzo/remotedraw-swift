@@ -58,7 +58,7 @@ public enum RemoteDrawInkComposer {
       // built yet — an uncapped run is the mark this renderer drew before the
       // ceiling existed, where a dropped run would not be.
       var capped: (floor: Double, scale: Double, field: CGImage)?
-      if let capacity = current?.capacity, let field, extent > 0 {
+      if let capacity = current?.inner.capacity, let field, extent > 0 {
         let floor = min(1, max(0, capacity.floor))
         capped = (
           floor: floor,
@@ -66,13 +66,13 @@ public enum RemoteDrawInkComposer {
           field: field
         )
       }
-      guard capped != nil || current?.multiply == true else {
+      guard capped != nil || current?.inner.multiply == true else {
         for item in run { paint(item, &context) }
         index = end
         continue
       }
       var target = context
-      if current?.multiply == true { target.blendMode = .multiply }
+      if current?.inner.multiply == true { target.blendMode = .multiply }
       target.drawLayer { outer in
         if let capped {
           outer.clipToLayer { mask in
@@ -105,28 +105,22 @@ public enum RemoteDrawInkComposer {
     guard type != "text", type != "point", pointCount > 1 else { return nil }
     guard let film = RemoteDrawInk.film(for: DrawingStyleKind(rawValue: style?.kind ?? ""), surface: surface)
     else { return nil }
-    return Film(film)
+    return Film(inner: film)
   }
 
   /// An opaque ceiling identity.
   ///
   /// Public so a caller can group by it; deliberately carrying no readable
   /// members, because everything inside is instrument tuning that changes with
-  /// the ink pipeline and nobody outside can act on.
-  public struct Film: Equatable, Sendable {
-    let capacity: (floor: Double, gain: Double)?
-    let multiply: Bool
-
-    init(_ film: RemoteDrawInk.Film) {
-      capacity = film.capacity.map { (floor: $0.floor, gain: $0.gain) }
-      multiply = film.multiply
-    }
-
-    public static func == (lhs: Film, rhs: Film) -> Bool {
-      lhs.multiply == rhs.multiply
-        && lhs.capacity?.floor == rhs.capacity?.floor
-        && lhs.capacity?.gain == rhs.capacity?.gain
-    }
+  /// the ink pipeline and nobody outside can act on. Equality is the inner
+  /// film's own, so a term added to `RemoteDrawInk.Film` is compared here by
+  /// construction rather than by a comparison someone has to remember to extend.
+  ///
+  /// `@unchecked` only because the inner film is declared in the renderer,
+  /// which stays free of module-boundary edits; it is two `Double`s and a
+  /// `Bool`, nothing a thread could observe changing.
+  public struct Film: Equatable, @unchecked Sendable {
+    let inner: RemoteDrawInk.Film
   }
 
   /// Starts rasterising the tooth field an instrument will need, before a

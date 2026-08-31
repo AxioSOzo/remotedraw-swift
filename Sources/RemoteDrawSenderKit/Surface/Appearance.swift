@@ -25,6 +25,17 @@ public struct RemoteDrawAppearance: Sendable {
   /// wants — a whiteboard board should not draw on paper because the SDK's
   /// default said so.
   public var ground: RemoteDrawGround?
+  /// Field furniture drawn over the ground and under the ink.
+  ///
+  /// `nil` follows the board: an `approval` board gets the box, a `pointer`
+  /// board the crosshair, everything else nothing. Set it to
+  /// ``RemoteDrawFieldGuide/none`` to draw furniture on no board at all, or to a
+  /// case to draw it on every board.
+  ///
+  /// The guide is *shape*, never copy — that is why it is an enum of drawings
+  /// rather than a preset name. What an approval box **means** stays with the
+  /// host, in ``RemoteDrawStrings`` and its own chrome.
+  public var fieldGuide: RemoteDrawFieldGuide?
   /// The corner the sheet is drawn with when the phone is a window onto a
   /// larger board. A board the phone *is* has no corner: it runs edge to edge.
   public var cornerRadius: CGFloat
@@ -47,6 +58,7 @@ public struct RemoteDrawAppearance: Sendable {
     muted: Color = RemoteDrawAppearance.defaultMuted,
     highlighter: Color = RemoteDrawAppearance.defaultHighlighter,
     ground: RemoteDrawGround? = nil,
+    fieldGuide: RemoteDrawFieldGuide? = nil,
     cornerRadius: CGFloat = 18,
     maximumDynamicTypeSize: DynamicTypeSize = .xxxLarge,
     handedness: RemoteDrawHandedness = .automatic,
@@ -57,6 +69,7 @@ public struct RemoteDrawAppearance: Sendable {
     self.muted = muted
     self.highlighter = highlighter
     self.ground = ground
+    self.fieldGuide = fieldGuide
     self.cornerRadius = cornerRadius
     self.maximumDynamicTypeSize = maximumDynamicTypeSize
     self.handedness = handedness

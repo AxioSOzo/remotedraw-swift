@@ -1,13 +1,22 @@
 @_exported import RemoteDrawInk
 import Foundation
+import os
 
 /// The one entry point.
 ///
-/// Configured once, everything else defaulted:
+/// Nothing to configure in the common case — ``shared`` installs
+/// `RemoteDrawConfiguration()` (production, this device, no token provider) the
+/// first time anyone reads it:
 ///
 /// ```swift
-/// RemoteDraw.configure(.init(apiBaseURL: .production))
 /// let session = try await RemoteDraw.shared.join(rawToken: senderToken)
+/// ```
+///
+/// ``configure(_:)`` is the override, for a host that needs a different base
+/// URL, an anonymous device description, or a token provider:
+///
+/// ```swift
+/// RemoteDraw.configure(.init(apiBaseURL: .production, tokenProvider: mintToken))
 /// ```
 ///
 /// This is the Stage 1 surface — the headless core. The presentation,
@@ -18,32 +27,70 @@ import Foundation
 public final class RemoteDraw: @unchecked Sendable {
   /// The version this build reports in `X-RemoteDraw-SDK`, and the one a
   /// `clientAdvisory` compares against.
-  public static let sdkVersion = "0.1.0"
+  public static let sdkVersion = "0.3.0"
 
   private static let lock = NSLock()
   nonisolated(unsafe) private static var _shared: RemoteDraw?
 
-  /// The configured instance.
+  private static let logger = Logger(subsystem: "com.remotedraw.senderkit", category: "config")
+  nonisolated(unsafe) private static var hasLoggedAutoConfiguration = false
+
+  /// The instance, configuring itself against production on first use.
   ///
-  /// Traps with an actionable message rather than returning an optional every
-  /// call site would have to unwrap: forgetting to configure is a wiring
-  /// mistake caught on the first run, not a runtime condition to handle.
+  /// ## Zero config is the supported path
+  ///
+  /// Every field of ``RemoteDrawConfiguration`` already has a working default,
+  /// so `RemoteDrawConfiguration()` alone talks to `api.remotedraw.com` and
+  /// describes this device the way the first-party app does. Reading this
+  /// property before anyone called ``configure(_:)`` therefore installs exactly
+  /// that and carries on — a host that only needs the defaults writes one line
+  /// (the surface) instead of two.
+  ///
+  /// This **used to trap**, and the trap was unreachable from the place it
+  /// fired: `.remoteDrawSurface`'s `.task` calls this, and a
+  /// `preconditionFailure` is not an `Error`, so the `catch` beside it could
+  /// never turn a missing `configure` into an outcome the host could see. The
+  /// customer got a crash on the user's tap. A host that genuinely wants the
+  /// strict behaviour asks for it explicitly with ``requireConfigured()``.
+  ///
+  /// ``configure(_:)`` still wins, whenever it is called — including after this
+  /// auto-configuration, which it replaces.
   public static var shared: RemoteDraw {
     lock.lock()
     defer { lock.unlock() }
-    guard let _shared else {
-      preconditionFailure(
-        "RemoteDraw is not configured. Call RemoteDraw.configure(.init(apiBaseURL: .production)) from your App's init.")
+    if let _shared { return _shared }
+    let instance = RemoteDraw(configuration: RemoteDrawConfiguration())
+    _shared = instance
+    if !hasLoggedAutoConfiguration {
+      hasLoggedAutoConfiguration = true
+      logger.info(
+        "RemoteDraw auto-configured against production. Call RemoteDraw.configure(_:) from your App's init to override the API base URL, the device description, or the token provider."
+      )
     }
-    return _shared
+    return instance
   }
 
-  /// Whether ``shared`` is usable, for a host that wants to check rather than
-  /// trap.
+  /// Whether an instance exists yet.
+  ///
+  /// True after ``configure(_:)`` **or** after the first read of ``shared``,
+  /// which configures the defaults. False only before either has happened.
   public static var isConfigured: Bool {
     lock.lock()
     defer { lock.unlock() }
     return _shared != nil
+  }
+
+  /// The instance, or ``RemoteDrawError/notConfigured`` — for a host that wants
+  /// a missing ``configure(_:)`` to be an error rather than a default.
+  ///
+  /// Never auto-configures. The one place in the SDK where "you forgot to
+  /// configure" is still a distinct answer, and it is a thrown error a host can
+  /// route into its own reporting rather than a trap it cannot catch.
+  public static func requireConfigured() throws -> RemoteDraw {
+    lock.lock()
+    defer { lock.unlock() }
+    guard let _shared else { throw RemoteDrawError.notConfigured }
+    return _shared
   }
 
   public static func configure(_ configuration: RemoteDrawConfiguration) {
@@ -94,7 +141,8 @@ public final class RemoteDraw: @unchecked Sendable {
     )
   }
 
-  /// Forgets the configuration. Tests only; a shipping app configures once.
+  /// Forgets the configuration. Tests only; a shipping app configures once, or
+  /// not at all.
   public static func reset() {
     lock.lock()
     defer { lock.unlock() }
