@@ -8,39 +8,100 @@ import SwiftUI
 /// Non-blocking "snap to shape" offer, shown after a mid-confidence stroke
 /// commits.
 ///
-/// Tapping replaces the committed freehand ink with the recognised primitive;
-/// drawing again simply dismisses it. It never blocks input, which is the whole
-/// reason it is a pill floating over the board rather than a dialog: a
-/// suggestion that stops you drawing has cost more than it offered.
+/// A small capsule that answers the offer: a muted ✕ that keeps the stroke as
+/// drawn, the shape's name, and a solid ✓ that replaces the freehand ink with
+/// the recognised primitive. It carries no wand and no "Snap to shape" — the
+/// surface draws the offered shape in place as a ghost
+/// (``RemoteDrawSenderSurface``), so the chip only has to say *which* shape and
+/// take the answer. Drawing again still dismisses it, and it never blocks
+/// input: a suggestion that stops you drawing has cost more than it offered.
 public struct RemoteDrawShapeSnapPill: View {
-  let onTap: () -> Void
+  let shapeName: String?
+  let onAccept: () -> Void
+  let onDismiss: (() -> Void)?
 
   @Environment(\.remoteDrawAppearance) private var appearance
   @Environment(\.remoteDrawStrings) private var strings
 
+  /// - Parameters:
+  ///   - shapeName: what the offer would make — "Rectangle", "Line". `nil`
+  ///     falls back to the generic label.
+  ///   - onAccept: replace the stroke with the shape.
+  ///   - onDismiss: keep the stroke as drawn. `nil` hides the ✕; the offer then
+  ///     expires on its own or on the next stroke, as before.
+  public init(
+    shapeName: String? = nil,
+    onAccept: @escaping () -> Void,
+    onDismiss: (() -> Void)? = nil
+  ) {
+    self.shapeName = shapeName
+    self.onAccept = onAccept
+    self.onDismiss = onDismiss
+  }
+
+  /// The pre-preview pill: one tap, one label. Kept so a host that shipped it
+  /// still compiles; it now renders the accept half of the chip.
+  @available(*, deprecated, message: "Use init(shapeName:onAccept:onDismiss:); the offer is previewed in place and answered with accept or dismiss.")
   public init(onTap: @escaping () -> Void) {
-    self.onTap = onTap
+    self.init(shapeName: nil, onAccept: onTap, onDismiss: nil)
   }
 
   public var body: some View {
-    Button(action: onTap) {
-      HStack(spacing: 7) {
-        Image(systemName: "wand.and.stars")
-          .font(.system(size: 14, weight: .semibold))
-        Text(strings.snapToShape)
-          .font(.system(size: 14, weight: .semibold))
+    let label = shapeName ?? strings.snapToShape
+    HStack(spacing: 2) {
+      if let onDismiss {
+        Button(action: onDismiss) {
+          Image(systemName: "xmark")
+            .font(.system(size: 15, weight: .bold))
+            .foregroundStyle(appearance.ink.opacity(0.62))
+            .frame(width: 40, height: 40)
+        }
+        .buttonStyle(RemoteDrawShapeSnapChipButtonStyle())
+        .accessibilityLabel(strings.keepAsDrawn)
       }
-      .foregroundStyle(appearance.ink)
-      .padding(.horizontal, 14)
-      .padding(.vertical, 9)
-      .background(.regularMaterial, in: Capsule())
-      .overlay(
-        Capsule().stroke(Color.black.opacity(0.12), lineWidth: 1)
-      )
-      .shadow(color: .black.opacity(0.10), radius: 12, y: 4)
+      Text(label)
+        .font(.system(size: 12.5, weight: .semibold))
+        .foregroundStyle(appearance.ink.opacity(0.72))
+        .padding(.horizontal, 8)
+        .lineLimit(1)
+      Button(action: onAccept) {
+        Image(systemName: "checkmark")
+          .font(.system(size: 15, weight: .heavy))
+          .foregroundStyle(.white)
+          .frame(width: 40, height: 40)
+          .background(Circle().fill(appearance.ink))
+      }
+      .buttonStyle(RemoteDrawShapeSnapChipButtonStyle())
+      .accessibilityLabel("\(strings.snapToShape): \(label)")
     }
-    .buttonStyle(.plain)
-    .accessibilityLabel("Snap stroke to recognised shape")
+    .padding(4)
+    .background(.regularMaterial, in: Capsule())
+    .overlay(Capsule().strokeBorder(Color.black.opacity(0.10), lineWidth: 1))
+    .shadow(color: .black.opacity(0.06), radius: 1, y: 1)
+    .shadow(color: .black.opacity(0.12), radius: 14, y: 6)
+    .accessibilityElement(children: .contain)
+    .accessibilityLabel("\(strings.snapToShape): \(label)?")
+  }
+}
+
+/// The chip's two circles: a press is a squeeze, nothing else.
+struct RemoteDrawShapeSnapChipButtonStyle: ButtonStyle {
+  func makeBody(configuration: Configuration) -> some View {
+    configuration.label
+      .contentShape(Circle())
+      .scaleEffect(configuration.isPressed ? 0.92 : 1)
+      .opacity(configuration.isPressed ? 0.8 : 1)
+      .animation(.spring(response: 0.25, dampingFraction: 0.7), value: configuration.isPressed)
+  }
+}
+
+/// The chip's measured size, reported up so the surface can place it by its
+/// centre without guessing how wide the shape's name came out.
+struct ShapeSnapChipSizeKey: PreferenceKey {
+  static let defaultValue: CGSize = .zero
+  static func reduce(value: inout CGSize, nextValue: () -> CGSize) {
+    let next = nextValue()
+    if next != .zero { value = next }
   }
 }
 

@@ -1,6 +1,43 @@
-# RemoteDrawSenderKit
+# RemoteDraw for Swift
 
-The RemoteDraw sender, as a Swift package. Capture a stroke, put it on a board.
+RemoteDraw's Swift package. Three libraries, one package, no external
+dependencies:
+
+| Product | For | Platforms |
+| --- | --- | --- |
+| `RemoteDrawSenderKit` | The phone side: capture a stroke, put it on a board. | iOS 17+ (headless core also macOS 14+) |
+| `RemoteDrawReceiverKit` | The surface side: show a session's ink, pair phones, undo/clear/end. | macOS 14+, iOS/iPadOS 17+ |
+| `RemoteDrawInk` | The shared ink renderer both kits draw with. Re-exported by both. | macOS 14+, iOS 17+ |
+
+## Install
+
+```swift
+// Package.swift
+dependencies: [
+  .package(url: "https://github.com/AxioSOzo/remotedraw-swift.git", from: "0.4.0"),
+],
+targets: [
+  .target(name: "MyApp", dependencies: [
+    .product(name: "RemoteDrawSenderKit", package: "remotedraw-swift"),    // phone
+    .product(name: "RemoteDrawReceiverKit", package: "remotedraw-swift"),  // surface
+  ]),
+]
+```
+
+In Xcode: *File → Add Package Dependencies…*, paste the URL, and link the
+product(s) you need. `package:` is the repository basename (`remotedraw-swift`),
+not a module name. Both kits re-export `RemoteDrawInk`, so an app that imports
+both sees one set of ink types — no module qualification needed.
+
+`from: "0.4.0"` is SwiftPM's up-to-next-major range; use
+`.upToNextMinor(from: "0.4.0")` to stay on `0.4.x` while the API is `0.x`.
+
+The receiver is documented [below](#receiver-remotedrawreceiverkit). Everything
+until then is the sender.
+
+## Sender: `RemoteDrawSenderKit`
+
+The RemoteDraw sender. Capture a stroke, put it on a board.
 
 Two ways in, and you can stop at either.
 
@@ -281,10 +318,78 @@ RemoteDraw.configure(.init(
 which omits the key from the request body entirely, and lets you delete that
 entry from your own report.
 
+`RemoteDrawReceiverKit` and `RemoteDrawInk` ship no privacy manifest of their
+own: they use no required-reason APIs and collect nothing. The receiver only
+reads a session your backend created, with a scoped receiver token.
+
+<a id="receiver-remotedrawreceiverkit"></a>
+
+## Receiver: `RemoteDrawReceiverKit`
+
+The surface side: a Mac (or iPad) that shows what phones draw. An HTTP receiver
+transport, an observable polling store, pairing (code, link and an on-device QR
+code) and a SwiftUI board that paints with the same `RemoteDrawInk` renderer the
+sender uses.
+
+```swift
+import RemoteDrawReceiverKit
+import SwiftUI
+
+@MainActor
+final class ReceiverModel: ObservableObject {
+  let transport = RemoteDrawReceiverHTTPTransport(
+    baseURL: URL(string: "https://api.remotedraw.com")!
+  )
+  lazy var store = RemoteDrawReceiverStore(transport: transport)
+}
+
+struct BoardScreen: View {
+  @StateObject private var model = ReceiverModel()
+  let sessionId: String, receiverToken: String   // from your backend
+
+  var body: some View {
+    RemoteDrawReceiverView(store: model.store, control: model.transport)
+      .task { model.store.start(credentials: .init(sessionId: sessionId, receiverToken: receiverToken)) }
+      .onDisappear { model.store.stop() }
+  }
+}
+```
+
+- **Credentials.** Your backend creates the session with the account API key and
+  hands the app only the `sessionId` and the scoped `receiverToken`. Never embed
+  an account key in an app.
+- **Views.** `RemoteDrawReceiverBoard(store:)` is the drawing alone.
+  `RemoteDrawReceiverView(store:control:)` adds pairing, connected-phone count,
+  undo, clear and end session, and reports the surface size to the server after
+  a resize. `RemoteDrawReceiverQRCode(url:)` renders a join URL with Core Image —
+  no third-party service sees it. AppKit hosts use `NSHostingView(rootView:)`,
+  UIKit hosts `UIHostingController(rootView:)`.
+- **Lifecycle.** `start(credentials:)` begins polling; `stop()` disconnects
+  locally; `transport.endSession(credentials)` ends the session on the server.
+  Foreground/background policy is the host's.
+- **Your own UI.** `RemoteDrawReceiverStore.snapshot` (session, drawings, live
+  drafts, senders) is `@Published`; render it however you like, or implement
+  `RemoteDrawReceiverTransport` for tests.
+
+### What the receiver does not do yet
+
+- **Polling only:** one second idle, 250 ms while a phone is drawing, with a
+  cheap `/v1/receiver/sync` revision check first. No WebSocket or video stream;
+  latency includes network round trips.
+- **Normalized boards only.** The board fills the view. Map/world projection,
+  image elements and aspect-preserving embedded content need a host renderer;
+  hidden drawings and unsupported element types are not painted.
+- **No image export** of the board.
+- `RemoteDrawReceiverView`'s header still reads "RemoteDraw · In development".
+  Use `RemoteDrawReceiverBoard` with your own chrome if that matters.
+- The receiver API is younger than the sender's and may still change in `0.x`
+  minors. Hardware acceptance on Mac and iPhone/iPad is still in progress.
+
 ## Working on it
 
 ```
 bun run ios:sdk:test     # swift test — hermetic, no simulator, seconds
+bun run ios:sdk:mirror   # export the public package and run its whole suite there
 bun run ios:sdk:parse    # typechecks the UIKit capture layer against the iOS SDK
 bun run codec:fixtures   # regenerates the golden vectors
 ```
@@ -313,3 +418,13 @@ table changes:
 cp packages/geometry/tests/fixtures/mapBoardGeometryVectors.json \
    apps/ios/RemoteDrawSenderKit/Tests/RemoteDrawSenderKitTests/Fixtures/
 ```
+
+### HTTP draft latency
+
+Drafts keep the latest pending stroke state and allow one outstanding HTTP call.
+The 32 ms interval limits send rate; it is not a delivery guarantee. A delayed
+fake transport measured about 9.5 Hz at 100 ms RTT and 4.7 Hz at 200 ms RTT on the
+local test machine. Reliable commits use a newer sequence and retain their
+idempotency key. Canceling a draft drain cannot clear the next stroke's drain
+ownership. A persistent draft transport or bounded concurrency would need
+separate ordering/recovery validation; this SDK does not add HTTP concurrency.

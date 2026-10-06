@@ -252,6 +252,10 @@
   }
 
   /// The assembled sheet, for a host that wants it whole.
+  ///
+  /// The layered design — bar, preview, tool carousel, Size · Colour · Fill,
+  /// shape control — lives in ``RemoteDrawToolSheet``; this binds it to a
+  /// session and puts handedness on the Settings page.
   public struct RemoteDrawControlsSheet: View {
     @ObservedObject var session: RemoteDrawSenderSession
     @Binding var selectedTool: RemoteDrawTool
@@ -263,7 +267,7 @@
     let onLeave: (() -> Void)?
 
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.remoteDrawStrings) private var strings
+    @State private var showsSettings = false
 
     public init(
       session: RemoteDrawSenderSession,
@@ -285,38 +289,47 @@
       self.onLeave = onLeave
     }
 
+    private var kind: Binding<DrawingStyleKind> {
+      Binding(
+        get: { DrawingStyleKind(rawValue: styleKindRaw) ?? RemoteDrawPreferences.defaultStyleKind },
+        set: { styleKindRaw = $0.rawValue })
+    }
+
     public var body: some View {
-      NavigationStack {
-        Form {
-          RemoteDrawToolSection(
-            selection: $selectedTool, tools: session.capabilities.grantedTools)
-          RemoteDrawInstrumentSection(
-            styleKindRaw: $styleKindRaw,
-            thickness: $thickness,
-            colorRaw: $colorRaw,
-            isFillEnabled: $isFillEnabled
-          )
-          RemoteDrawSessionSection(
-            canUndo: session.capabilities.contains(.undo),
-            canClear: session.capabilities.contains(.clear),
-            onUndo: { Task { try? await session.undo() } },
-            onClear: { Task { try? await session.clear() } },
-            onLeave: onLeave.map { leave in
-              {
-                dismiss()
-                leave()
-              }
-            }
-          )
-          RemoteDrawHandednessSection(handednessRaw: $handednessRaw)
-        }
-        .navigationTitle(strings.controls)
-        .navigationBarTitleDisplayMode(.inline)
-        .toolbar {
-          ToolbarItem(placement: .confirmationAction) {
-            Button("Done") { dismiss() }
+      RemoteDrawToolSheet(
+        kind: kind,
+        thickness: $thickness,
+        colorRaw: $colorRaw,
+        isFillEnabled: $isFillEnabled,
+        selectedTool: $selectedTool,
+        tools: session.capabilities.grantedTools,
+        showsSettings: $showsSettings,
+        canUndo: session.capabilities.contains(.undo),
+        canClear: session.capabilities.contains(.clear),
+        onUndo: { Task { try? await session.undo() } },
+        onClear: { Task { try? await session.clear() } },
+        onLeave: onLeave.map { leave in
+          {
+            dismiss()
+            leave()
           }
         }
+      ) {
+        Button {
+          showsSettings = true
+        } label: {
+          Label("Settings…", systemImage: "gearshape")
+        }
+      } insert: {
+        EmptyView()
+      } settings: {
+        Form {
+          RemoteDrawHandednessSection(handednessRaw: $handednessRaw)
+        }
+        .navigationTitle("Settings")
+        .navigationBarTitleDisplayMode(.inline)
+      } footer: {
+        EmptyView()
       }
     }
   }
@@ -345,13 +358,13 @@
   extension RemoteDrawTool {
     public var title: String {
       switch self {
-      case .auto: return "Auto"
+      case .auto: return "Smart"
       case .freehand: return "Freehand"
       case .line: return "Line"
       case .arrow: return "Arrow"
       case .rectangle: return "Rectangle"
       case .ellipse: return "Ellipse"
-      case .point: return "Point"
+      case .point: return "Dot"
       case .text: return "Text"
       }
     }

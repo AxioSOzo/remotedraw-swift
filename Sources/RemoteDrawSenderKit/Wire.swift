@@ -4,16 +4,16 @@ import Foundation
 
 /// Every route a phone holding only a sender token may call.
 ///
-/// Fourteen shipping today: thirteen sender routes plus `/v1/join`, which is
-/// the one that mints the token the other thirteen carry. `convex/http.ts`
-/// registers 107 routes; the rest need an API key, a receiver token, or an
-/// account, and none of them belong in an SDK that ships inside somebody else's
-/// app.
+/// Sixteen: fifteen sender routes plus `/v1/join`, which is the one that mints
+/// the token the other fifteen carry. `convex/http.ts` registers many more; the
+/// rest need an API key, a receiver token, or an account, and none of them
+/// belong in an SDK that ships inside somebody else's app.
 ///
-/// ``refresh`` is the fifteenth and is **not live yet**: it is item 3 of
-/// `docs/plans/ios-sender-sdk.md` §4.0, and a deployment without it answers
-/// 404, which ``RemoteDrawSenderSession`` treats as "fall through to the host's
-/// token provider" rather than as a failure.
+/// ``refresh`` rotates this sender's own credential. If it fails for any reason
+/// ``RemoteDrawSenderSession`` falls through to the host's token provider rather
+/// than treating the failure as final. ``sync`` answers revision tokens only;
+/// a deployment that predates it answers a bare 404, which the HTTP transport
+/// reports as ``RemoteDrawSyncUnsupportedError``.
 ///
 /// Everything is `POST` with a JSON object body, and **the credential travels in
 /// the body, never in an `Authorization` header** — that header belongs to API
@@ -34,6 +34,9 @@ public enum RemoteDrawSenderRoute: String, CaseIterable, Sendable {
   case projection = "/v1/sender/projection"
   case closeProjection = "/v1/sender/projection/close"
   case refresh = "/v1/sender/refresh"
+  /// Opaque revision tokens that say *whether* a snapshot is worth reading.
+  /// See ``RemoteDrawSyncRevisions``.
+  case sync = "/v1/sender/sync"
 
   /// The capability a session must grant before this route will answer.
   /// `nil` means every sender may call it.
@@ -44,7 +47,9 @@ public enum RemoteDrawSenderRoute: String, CaseIterable, Sendable {
     switch self {
     case .undo: return .undo
     case .clear: return .clear
-    case .submit: return .submit
+    // The server gates `submit` on a live sender token alone (`sender.submit`
+    // → `requireSenderControlMutation`) and never grants a "submit"
+    // capability, so requiring one made every real submit fail locally.
     case .drawings: return .viewExisting
     case .projection, .closeProjection: return .moveViewport
     default: return nil
@@ -245,6 +250,9 @@ public struct RemoteDrawProjection: Codable, Equatable, Sendable {
   public let width: Double
   public let height: Double
   public let rotationDegrees: Double
+  public let tiltXDegrees: Double?
+  public let tiltYDegrees: Double?
+  public let hardwareRotationDegrees: Double?
   public let aspectRatio: Double
   public let coordinateAspectRatio: Double?
   public let connected: Bool?
@@ -256,6 +264,9 @@ public struct RemoteDrawProjection: Codable, Equatable, Sendable {
     width: Double,
     height: Double,
     rotationDegrees: Double = 0,
+    tiltXDegrees: Double? = nil,
+    tiltYDegrees: Double? = nil,
+    hardwareRotationDegrees: Double? = nil,
     aspectRatio: Double,
     coordinateAspectRatio: Double? = nil,
     connected: Bool? = nil,
@@ -266,6 +277,9 @@ public struct RemoteDrawProjection: Codable, Equatable, Sendable {
     self.width = width
     self.height = height
     self.rotationDegrees = rotationDegrees
+    self.tiltXDegrees = tiltXDegrees
+    self.tiltYDegrees = tiltYDegrees
+    self.hardwareRotationDegrees = hardwareRotationDegrees
     self.aspectRatio = aspectRatio
     self.coordinateAspectRatio = coordinateAspectRatio
     self.connected = connected
@@ -305,21 +319,25 @@ public struct RemoteDrawTarget: Decodable, Equatable, Sendable {
   public let inputMapping: RemoteDrawInputMapping?
   /// The board's own units. `nil` when the board declares none.
   public let coordinateSpace: RemoteDrawCoordinateSpace?
+  public let staticBackground: RemoteDrawStaticBackground?
 
   private enum CodingKeys: String, CodingKey {
     case kind, label, inputMapping, coordinateSpace
+    case staticBackground = "static"
   }
 
   public init(
     kind: String,
     label: String? = nil,
     inputMapping: RemoteDrawInputMapping? = nil,
-    coordinateSpace: RemoteDrawCoordinateSpace? = nil
+    coordinateSpace: RemoteDrawCoordinateSpace? = nil,
+    staticBackground: RemoteDrawStaticBackground? = nil
   ) {
     self.kind = kind
     self.label = label
     self.inputMapping = inputMapping
     self.coordinateSpace = coordinateSpace
+    self.staticBackground = staticBackground
   }
 
   public init(from decoder: Decoder) throws {
@@ -333,6 +351,7 @@ public struct RemoteDrawTarget: Decodable, Equatable, Sendable {
       RemoteDrawInputMapping.self, forKey: .inputMapping)
     coordinateSpace = try? container.decodeIfPresent(
       RemoteDrawCoordinateSpace.self, forKey: .coordinateSpace)
+    staticBackground = try? container.decodeIfPresent(RemoteDrawStaticBackground.self, forKey: .staticBackground)
   }
 
   /// The ground this target asks the renderer for.
@@ -425,7 +444,19 @@ public struct RemoteDrawCoordinateSpace: Decodable, Equatable, Sendable {
 /// not recognise must not cost the sender its token, so anything unfamiliar is
 /// dropped rather than thrown: see ``RemoteDrawJoinResponse``, which decodes
 /// this with `try?` for exactly that reason.
+public struct RemoteDrawAnnotationInput: Decodable, Equatable, Sendable {
+  public let revision: Int
+  public let paused: Bool
+}
+
 public struct RemoteDrawSession: Decodable, Equatable, Sendable {
+  /// Complete admitted snapshot for a host's richer metadata adapter.
+  public let payload: RemoteDrawSnapshotPayload
+  /// Monotonic logical board geometry version; legacy servers decode as zero.
+  public let annotationInput: RemoteDrawAnnotationInput?
+  public let geometryRevision: Int
+  /// Display bounds for contain-mode presentation; canonical board units stay unchanged.
+  public let surfacePresentation: RemoteDrawCoordinateSpace?
   public let id: String
   public let status: String
   public let target: RemoteDrawTarget?
@@ -466,14 +497,25 @@ public struct RemoteDrawSession: Decodable, Equatable, Sendable {
   /// (`submitLabel`) live in `RemoteDrawTargetMetadata`, which stayed
   /// first-party, because a host names its own button.
   public let submission: RemoteDrawSubmissionState?
+  /// The experimental live-update tier this session negotiated, if any.
+  ///
+  /// `nil` on every session that asked for nothing and on every older server,
+  /// and `nil` means 32 ms. Present but unreadable decodes to a block that
+  /// paces at 32 ms too — see ``RemoteDrawLiveUpdateState/negotiatedTier``.
+  public let liveUpdate: RemoteDrawLiveUpdateState?
 
   private enum CodingKeys: String, CodingKey {
     case id, status, target, capabilities, expiresAt, phoneProjection, submission
-    case boardId, markupPreset, senderIntegrationMode, visualContext
+    case boardId, markupPreset, senderIntegrationMode, visualContext, geometryRevision, surfacePresentation, annotationInput
+    case liveUpdate
   }
 
   public init(from decoder: Decoder) throws {
     let container = try decoder.container(keyedBy: CodingKeys.self)
+    annotationInput = try container.decodeIfPresent(RemoteDrawAnnotationInput.self, forKey: .annotationInput)
+    payload = try RemoteDrawSnapshotPayload(from: decoder)
+    geometryRevision = try container.decodeIfPresent(Int.self, forKey: .geometryRevision) ?? 0
+    surfacePresentation = try? container.decodeIfPresent(RemoteDrawCoordinateSpace.self, forKey: .surfacePresentation)
     id = try container.decode(String.self, forKey: .id)
     status = try container.decodeIfPresent(String.self, forKey: .status) ?? "active"
     target = try? container.decodeIfPresent(RemoteDrawTarget.self, forKey: .target)
@@ -489,6 +531,15 @@ public struct RemoteDrawSession: Decodable, Equatable, Sendable {
       RemoteDrawProjection.self, forKey: .phoneProjection)
     submission = try? container.decodeIfPresent(
       RemoteDrawSubmissionState.self, forKey: .submission)
+    liveUpdate = try? container.decodeIfPresent(
+      RemoteDrawLiveUpdateState.self, forKey: .liveUpdate)
+  }
+
+  /// Whole-surface senders contain map/background and ink in one canonical rectangle.
+  /// Viewport senders retain their camera layout; receiver presentation never changes it.
+  public var usesContainedSurfacePresentation: Bool {
+    target?.mapsInputToSurface == true
+      && target?.coordinateSpace?.aspectRatio != nil && surfacePresentation?.aspectRatio != nil
   }
 
   public var isActive: Bool { status == "active" }
@@ -502,14 +553,12 @@ public struct RemoteDrawSession: Decodable, Equatable, Sendable {
 
   /// Whether this board expects its sender to show the receiver's live pixels.
   ///
-  /// Either half is enough, because the two say the same thing from opposite
-  /// ends: `senderIntegrationMode == .streaming` is the board asking for a
-  /// streaming sender, and `visualContext.enabled` is the board *publishing*
-  /// the stream a streaming sender would consume. A board that set only one is
-  /// still a board this SDK cannot draw, and answering "no" to half of it is
-  /// how the blank pad happened.
+  /// An explicit sender mode is authoritative. A receiver may offer pixels to
+  /// browser senders while a native sender renders the same board locally.
+  /// The visual-context fallback supports older payloads without a mode.
   public var requestsStreaming: Bool {
-    senderIntegrationMode == .streaming || visualContext?.enabled == true
+    if let senderIntegrationMode { return senderIntegrationMode == .streaming }
+    return visualContext?.enabled == true
   }
 }
 
@@ -705,6 +754,29 @@ public struct RemoteDrawSessionResponse: Decodable, Equatable, Sendable {
   public let lastSequence: Int?
 }
 
+/// `/v1/sender/sync` — cheap revision tokens, not content.
+///
+/// Every value is opaque: compare for equality, never parse or order them. A
+/// change says a snapshot read is worth paying for; it is not the snapshot, and
+/// a concurrent edit can move the revision again while that read is in flight.
+/// `metadata` also carries a coarse server clock bucket, so it changes on its
+/// own roughly every ten seconds even on an idle board.
+public struct RemoteDrawSyncRevisions: Decodable, Equatable, Sendable {
+  /// Committed elements. Gates `/v1/sender/drawings`.
+  public let drawings: String
+  /// Board metadata, grants, presence and projection. Gates `/v1/sender/session`.
+  public let metadata: String
+  public let drafts: String?
+  public let files: String?
+
+  public init(drawings: String, metadata: String, drafts: String? = nil, files: String? = nil) {
+    self.drawings = drawings
+    self.metadata = metadata
+    self.drafts = drafts
+    self.files = files
+  }
+}
+
 /// The answer to a live draft.
 ///
 /// `accepted == false` is a routine outcome, not a failure, which is why this
@@ -720,14 +792,52 @@ public struct RemoteDrawDraftAck: Decodable, Equatable, Sendable {
   public let accepted: Bool
   public let reason: String?
   public let lastSequence: Int?
+  /// The session's live-update state as the server saw it answering this
+  /// draft. Only experimental sessions carry it, and it is how a downgrade to
+  /// `normal` reaches a sender mid-stroke. Absent changes nothing.
+  public let liveUpdate: RemoteDrawLiveUpdateState?
+  /// How long to wait before the next draft, on a ``isLiveUpdateRateLimited``
+  /// refusal.
+  public let retryAfterMs: Double?
 
   /// The one rejection a sender can act on: continue from `lastSequence + 1`.
   public var isStaleSequence: Bool { !accepted && reason == "stale_sequence" }
 
-  public init(accepted: Bool, reason: String? = nil, lastSequence: Int? = nil) {
+  /// The experimental ceiling refused this draft. Routine, like a stale
+  /// sequence: nothing was stored, charged or advanced, and the sender waits
+  /// `retryAfterMs` rather than reporting an error.
+  public var isLiveUpdateRateLimited: Bool { !accepted && reason == "live_update_rate" }
+
+  private enum CodingKeys: String, CodingKey {
+    case accepted, reason, lastSequence, liveUpdate, retryAfterMs
+  }
+
+  public init(
+    accepted: Bool, reason: String? = nil, lastSequence: Int? = nil,
+    liveUpdate: RemoteDrawLiveUpdateState? = nil, retryAfterMs: Double? = nil
+  ) {
     self.accepted = accepted
     self.reason = reason
     self.lastSequence = lastSequence
+    self.liveUpdate = liveUpdate
+    self.retryAfterMs = retryAfterMs
+  }
+
+  /// The three original fields decode exactly as they always have; the two
+  /// optional ones cannot fail an answer.
+  public init(from decoder: Decoder) throws {
+    let container = try decoder.container(keyedBy: CodingKeys.self)
+    accepted = try container.decode(Bool.self, forKey: .accepted)
+    reason = try container.decodeIfPresent(String.self, forKey: .reason)
+    lastSequence = try container.decodeIfPresent(Int.self, forKey: .lastSequence)
+    // Missing changes nothing; an explicit null is an unreadable policy and
+    // must lower a previous experimental grant to normal pacing.
+    if container.contains(.liveUpdate) {
+      liveUpdate = try? container.decode(RemoteDrawLiveUpdateState.self, forKey: .liveUpdate)
+    } else {
+      liveUpdate = nil
+    }
+    retryAfterMs = (try? container.decodeIfPresent(Double.self, forKey: .retryAfterMs)) ?? nil
   }
 }
 
@@ -814,6 +924,29 @@ public struct RemoteDrawReplaceResult: Decodable, Equatable, Sendable {
 public struct RemoteDrawUndoResult: Decodable, Equatable, Sendable {
   public let removed: Bool
   public let drawingId: String?
+  public let undone: String?
+
+  public var didUndo: Bool { undone != nil || removed }
+  public var statusText: String {
+    switch undone ?? (removed ? "create" : "") {
+    case "create": return "Last stroke removed."
+    case "delete": return "Deleted elements restored."
+    case "clear": return "Cleared board restored."
+    case "setProperties": return "Element change undone."
+    case "reorder": return "Paint order restored."
+    case "": return "Nothing to undo."
+    default: return "Last action undone."
+    }
+  }
+  public let elements: [RemoteDrawEditedElement]?
+
+  public init(removed: Bool, drawingId: String?, undone: String? = nil,
+    elements: [RemoteDrawEditedElement]? = nil) {
+    self.removed = removed
+    self.drawingId = drawingId
+    self.undone = undone
+    self.elements = elements
+  }
 }
 
 public struct RemoteDrawClearResult: Decodable, Equatable, Sendable {
@@ -838,13 +971,70 @@ public struct RemoteDrawDrawing: Decodable, Equatable, Sendable, Identifiable {
   public let style: RemoteDrawDrawingStyle?
   public let points: [RemoteDrawNormalizedPoint]
   public let text: String?
+  public var imageAssetId: String? = nil
+  public var imageMimeType: String? = nil
+  public var imageUrl: String? = nil
   public let hidden: Bool?
   public let revision: Int?
+}
+
+extension RemoteDrawDrawing {
+  private enum CodingKeys: String, CodingKey {
+    case id, type, style, points, packedPoints, text, imageAssetId, imageMimeType, imageUrl,
+      hidden, revision
+  }
+
+  /// Reads either point form. `/v1/sender/drawings` is asked for
+  /// `encoding: "packed"`, and a server that honours it sends `packedPoints`
+  /// wherever the codec can carry the stroke (plain `points` elsewhere, and
+  /// everywhere on a server that predates the option). A stream that fails to
+  /// decode costs that one element its ink, never the whole board.
+  public init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    id = try c.decode(String.self, forKey: .id)
+    type = try c.decode(String.self, forKey: .type)
+    style = try c.decodeIfPresent(RemoteDrawDrawingStyle.self, forKey: .style)
+    if let points = try c.decodeIfPresent([RemoteDrawNormalizedPoint].self, forKey: .points) {
+      self.points = points
+    } else if let packed = try c.decodeIfPresent(String.self, forKey: .packedPoints) {
+      points = PointCodec.unpackForDisplay(packed)
+    } else {
+      throw DecodingError.keyNotFound(
+        CodingKeys.points,
+        .init(codingPath: c.codingPath, debugDescription: "Neither points nor packedPoints."))
+    }
+    text = try c.decodeIfPresent(String.self, forKey: .text)
+    imageAssetId = try c.decodeIfPresent(String.self, forKey: .imageAssetId)
+    imageMimeType = try c.decodeIfPresent(String.self, forKey: .imageMimeType)
+    imageUrl = try c.decodeIfPresent(String.self, forKey: .imageUrl)
+    hidden = try c.decodeIfPresent(Bool.self, forKey: .hidden)
+    revision = try c.decodeIfPresent(Int.self, forKey: .revision)
+  }
 }
 
 public struct RemoteDrawDrawingsResponse: Decodable, Equatable, Sendable {
   public let session: RemoteDrawSession?
   public let items: [RemoteDrawDrawing]
+  /// Includes host-only element fields (locked, transform, projection, etc.).
+  /// Observe `drawingSnapshot` on the session, not transport completions.
+  ///
+  /// Always in the plain dialect: a packed answer's `packedPoints` are decoded
+  /// into `points` and its `encoding` marker dropped, so a host type decoded
+  /// from here reads `points` whichever answer the server gave. Always a whole
+  /// list too: the HTTP transport reads incrementally but rebuilds `items`
+  /// (and this) as the whole board, without the delta fields.
+  public var payload: RemoteDrawSnapshotPayload? = nil
+}
+
+extension RemoteDrawDrawingsResponse {
+  private enum CodingKeys: String, CodingKey { case session, items }
+
+  public init(from decoder: Decoder) throws {
+    let c = try decoder.container(keyedBy: CodingKeys.self)
+    session = try c.decodeIfPresent(RemoteDrawSession.self, forKey: .session)
+    items = try c.decode([RemoteDrawDrawing].self, forKey: .items)
+    payload = try RemoteDrawSnapshotPayload(from: decoder).expandingPackedDrawings()
+  }
 }
 
 extension Sequence where Element == RemoteDrawDrawing {

@@ -144,6 +144,12 @@ public struct RemoteDrawStrings: Sendable {
   public var submitted: String
   public var controls: String
   public var snapToShape: String
+  /// The ✕ on the shape-snap chip: the stroke stays as the hand made it.
+  public var keepAsDrawn: String
+  /// What the chip calls each offered shape, keyed by protocol type (`line`,
+  /// `arrow`, `rectangle`, `ellipse`, `point`). Missing keys fall back to the
+  /// English defaults.
+  public var shapeNames: [String: String]
   public var drawingAreaLabel: String
   public var drawingAreaHint: String
 
@@ -159,6 +165,8 @@ public struct RemoteDrawStrings: Sendable {
     submitted: String = "Submitted",
     controls: String = "Controls",
     snapToShape: String = "Snap to shape",
+    keepAsDrawn: String = "Keep as drawn",
+    shapeNames: [String: String] = [:],
     drawingAreaLabel: String = "Drawing area",
     drawingAreaHint: String = "Double-tap and hold, then drag, to draw."
   ) {
@@ -173,8 +181,15 @@ public struct RemoteDrawStrings: Sendable {
     self.submitted = submitted
     self.controls = controls
     self.snapToShape = snapToShape
+    self.keepAsDrawn = keepAsDrawn
+    self.shapeNames = shapeNames
     self.drawingAreaLabel = drawingAreaLabel
     self.drawingAreaHint = drawingAreaHint
+  }
+
+  /// The chip's name for a protocol drawing type.
+  public func shapeName(for type: String) -> String {
+    shapeNames[type] ?? RemoteDrawShapeSnapGeometry.shapeName(for: type)
   }
 
   public static let `default` = RemoteDrawStrings()

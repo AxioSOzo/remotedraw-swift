@@ -43,7 +43,6 @@ public enum RemoteDrawInkComposer {
     paint: (Item, inout GraphicsContext) -> Void
   ) {
     let extent = max(size.width, size.height)
-    let field = RemoteDrawInk.toothImage(for: surface, extent: extent)
     let sheet = CGRect(origin: .zero, size: CGSize(width: extent, height: extent))
     var index = 0
     while index < items.count {
@@ -58,7 +57,9 @@ public enum RemoteDrawInkComposer {
       // built yet — an uncapped run is the mark this renderer drew before the
       // ceiling existed, where a dropped run would not be.
       var capped: (floor: Double, scale: Double, field: CGImage)?
-      if let capacity = current?.inner.capacity, let field, extent > 0 {
+      if let capacity = current?.inner.capacity, extent > 0,
+        let field = RemoteDrawInk.capacityImage(for: surface, extent: extent, texture: capacity.texture)
+      {
         let floor = min(1, max(0, capacity.floor))
         capped = (
           floor: floor,

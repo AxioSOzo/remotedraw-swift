@@ -1,0 +1,988 @@
+{
+  "description": "Delta-application fixtures for incremental drawing reads (since). Shared by packages/protocol/tests/drawingChanges.test.ts, apps/ios/RemoteDrawKit/Tests/RemoteDrawKitTests/DrawingChangesTests.swift and (as a verbatim copy in its Fixtures) apps/ios/RemoteDrawSenderKit/Tests/RemoteDrawSenderKitTests/DrawingChangesTests.swift: each step lists the answers the server gives, the since values the client must send (and, where given, the pageToken of each request, null for none), and the ids it must hold afterwards, in paint order.",
+  "scenarios": [
+    {
+      "name": "append, update, remove, then an empty delta",
+      "steps": [
+        {
+          "answers": [
+            {
+              "items": [
+                {
+                  "id": "a",
+                  "type": "freehand",
+                  "createdAt": 1,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                },
+                {
+                  "id": "b",
+                  "type": "freehand",
+                  "createdAt": 2,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                }
+              ],
+              "removedIds": [],
+              "cursor": "2:0:0",
+              "reset": true,
+              "activeCount": 2
+            }
+          ],
+          "sent": [
+            ""
+          ],
+          "ids": [
+            "a",
+            "b"
+          ]
+        },
+        {
+          "answers": [
+            {
+              "items": [
+                {
+                  "id": "c",
+                  "type": "freehand",
+                  "createdAt": 3,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                },
+                {
+                  "id": "a",
+                  "type": "freehand",
+                  "createdAt": 1,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ],
+                  "zIndex": 5
+                }
+              ],
+              "removedIds": [
+                "b"
+              ],
+              "cursor": "5:0:0",
+              "reset": false,
+              "activeCount": 2
+            }
+          ],
+          "sent": [
+            "2:0:0"
+          ],
+          "ids": [
+            "c",
+            "a"
+          ]
+        },
+        {
+          "answers": [
+            {
+              "items": [],
+              "removedIds": [],
+              "cursor": "5:0:0",
+              "reset": false,
+              "activeCount": 2
+            }
+          ],
+          "sent": [
+            "5:0:0"
+          ],
+          "ids": [
+            "c",
+            "a"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "paint order: zIndex, then createdAt, then id by UTF-16 code unit",
+      "steps": [
+        {
+          "answers": [
+            {
+              "items": [
+                {
+                  "id": "b",
+                  "type": "freehand",
+                  "createdAt": 5,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                },
+                {
+                  "id": "B",
+                  "type": "freehand",
+                  "createdAt": 5,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                },
+                {
+                  "id": "a",
+                  "type": "freehand",
+                  "createdAt": 5,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ],
+                  "zIndex": -0.5
+                },
+                {
+                  "id": "_x",
+                  "type": "freehand",
+                  "createdAt": 1,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ],
+                  "zIndex": 0
+                },
+                {
+                  "id": "q",
+                  "type": "freehand",
+                  "createdAt": 0,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ],
+                  "zIndex": 0.25
+                }
+              ],
+              "removedIds": [],
+              "cursor": "5:0:0",
+              "reset": true,
+              "activeCount": 5
+            }
+          ],
+          "sent": [
+            ""
+          ],
+          "ids": [
+            "a",
+            "_x",
+            "B",
+            "b",
+            "q"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "a reset replaces the board",
+      "steps": [
+        {
+          "answers": [
+            {
+              "items": [
+                {
+                  "id": "a",
+                  "type": "freehand",
+                  "createdAt": 1,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                },
+                {
+                  "id": "b",
+                  "type": "freehand",
+                  "createdAt": 2,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                }
+              ],
+              "removedIds": [],
+              "cursor": "2:0:0",
+              "reset": true,
+              "activeCount": 2
+            }
+          ],
+          "sent": [
+            ""
+          ],
+          "ids": [
+            "a",
+            "b"
+          ]
+        },
+        {
+          "answers": [
+            {
+              "items": [
+                {
+                  "id": "z",
+                  "type": "freehand",
+                  "createdAt": 9,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                }
+              ],
+              "removedIds": [],
+              "cursor": "9:1:0",
+              "reset": true,
+              "activeCount": 1
+            }
+          ],
+          "sent": [
+            "2:0:0"
+          ],
+          "ids": [
+            "z"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "an activeCount mismatch rereads the whole board in the same call",
+      "steps": [
+        {
+          "answers": [
+            {
+              "items": [
+                {
+                  "id": "a",
+                  "type": "freehand",
+                  "createdAt": 1,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                }
+              ],
+              "removedIds": [],
+              "cursor": "1:0:0",
+              "reset": true,
+              "activeCount": 1
+            }
+          ],
+          "sent": [
+            ""
+          ],
+          "ids": [
+            "a"
+          ]
+        },
+        {
+          "answers": [
+            {
+              "items": [
+                {
+                  "id": "c",
+                  "type": "freehand",
+                  "createdAt": 3,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                }
+              ],
+              "removedIds": [],
+              "cursor": "4:0:0",
+              "reset": false,
+              "activeCount": 3
+            },
+            {
+              "items": [
+                {
+                  "id": "a",
+                  "type": "freehand",
+                  "createdAt": 1,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                },
+                {
+                  "id": "b",
+                  "type": "freehand",
+                  "createdAt": 2,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                },
+                {
+                  "id": "c",
+                  "type": "freehand",
+                  "createdAt": 3,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                }
+              ],
+              "removedIds": [],
+              "cursor": "4:0:0",
+              "reset": true,
+              "activeCount": 3
+            }
+          ],
+          "sent": [
+            "1:0:0",
+            ""
+          ],
+          "ids": [
+            "a",
+            "b",
+            "c"
+          ]
+        },
+        {
+          "answers": [
+            {
+              "items": [],
+              "removedIds": [],
+              "cursor": "4:0:0",
+              "reset": false,
+              "activeCount": 3
+            }
+          ],
+          "sent": [
+            "4:0:0"
+          ],
+          "ids": [
+            "a",
+            "b",
+            "c"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "an older server answers whole lists without a cursor, used in its own order",
+      "steps": [
+        {
+          "answers": [
+            {
+              "items": [
+                {
+                  "id": "a",
+                  "type": "freehand",
+                  "createdAt": 1,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "sent": [
+            ""
+          ],
+          "ids": [
+            "a"
+          ]
+        },
+        {
+          "answers": [
+            {
+              "items": [
+                {
+                  "id": "b",
+                  "type": "freehand",
+                  "createdAt": 2,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                },
+                {
+                  "id": "a",
+                  "type": "freehand",
+                  "createdAt": 1,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                }
+              ]
+            }
+          ],
+          "sent": [
+            ""
+          ],
+          "ids": [
+            "b",
+            "a"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "a paged reset: pages, then the closing delta from the first page's cursor",
+      "steps": [
+        {
+          "answers": [
+            {
+              "items": [
+                {
+                  "id": "a",
+                  "type": "freehand",
+                  "createdAt": 1,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                },
+                {
+                  "id": "b",
+                  "type": "freehand",
+                  "createdAt": 2,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                }
+              ],
+              "removedIds": [],
+              "cursor": "5:0:0",
+              "reset": true,
+              "activeCount": 2,
+              "nextPageToken": "p1.2"
+            },
+            {
+              "items": [
+                {
+                  "id": "c",
+                  "type": "freehand",
+                  "createdAt": 3,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                }
+              ],
+              "removedIds": [],
+              "cursor": "5:0:0",
+              "reset": false,
+              "activeCount": 1
+            },
+            {
+              "items": [
+                {
+                  "id": "b",
+                  "type": "freehand",
+                  "createdAt": 2,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ],
+                  "zIndex": 9
+                }
+              ],
+              "removedIds": [
+                "a"
+              ],
+              "cursor": "7:0:0",
+              "reset": false,
+              "activeCount": 2
+            }
+          ],
+          "sent": [
+            "",
+            "5:0:0",
+            "5:0:0"
+          ],
+          "pageTokens": [
+            null,
+            "p1.2",
+            null
+          ],
+          "ids": [
+            "c",
+            "b"
+          ]
+        },
+        {
+          "answers": [
+            {
+              "items": [],
+              "removedIds": [],
+              "cursor": "7:0:0",
+              "reset": false,
+              "activeCount": 2
+            }
+          ],
+          "sent": [
+            "7:0:0"
+          ],
+          "pageTokens": [
+            null
+          ],
+          "ids": [
+            "c",
+            "b"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "a page whose cursor no longer fits the session starts the pages over",
+      "steps": [
+        {
+          "answers": [
+            {
+              "items": [
+                {
+                  "id": "a",
+                  "type": "freehand",
+                  "createdAt": 1,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                }
+              ],
+              "removedIds": [],
+              "cursor": "5:0:0",
+              "reset": true,
+              "activeCount": 1,
+              "nextPageToken": "p1.1"
+            },
+            {
+              "items": [
+                {
+                  "id": "a",
+                  "type": "freehand",
+                  "createdAt": 1,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                }
+              ],
+              "removedIds": [],
+              "cursor": "6:1:0",
+              "reset": true,
+              "activeCount": 1,
+              "nextPageToken": "p1.1"
+            },
+            {
+              "items": [
+                {
+                  "id": "b",
+                  "type": "freehand",
+                  "createdAt": 2,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                }
+              ],
+              "removedIds": [],
+              "cursor": "6:1:0",
+              "reset": false,
+              "activeCount": 1
+            },
+            {
+              "items": [],
+              "removedIds": [],
+              "cursor": "6:1:0",
+              "reset": false,
+              "activeCount": 2
+            }
+          ],
+          "sent": [
+            "",
+            "5:0:0",
+            "6:1:0",
+            "6:1:0"
+          ],
+          "pageTokens": [
+            null,
+            "p1.1",
+            "p1.1",
+            null
+          ],
+          "ids": [
+            "a",
+            "b"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "a second mismatch in a row is accepted, cursor kept, rather than read again",
+      "steps": [
+        {
+          "answers": [
+            {
+              "items": [
+                {
+                  "id": "b",
+                  "type": "freehand",
+                  "createdAt": 2,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                },
+                {
+                  "id": "a",
+                  "type": "freehand",
+                  "createdAt": 1,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                }
+              ],
+              "removedIds": [],
+              "cursor": "2:0:0",
+              "reset": true,
+              "activeCount": 5
+            },
+            {
+              "items": [
+                {
+                  "id": "b",
+                  "type": "freehand",
+                  "createdAt": 2,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                },
+                {
+                  "id": "a",
+                  "type": "freehand",
+                  "createdAt": 1,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                }
+              ],
+              "removedIds": [],
+              "cursor": "2:0:0",
+              "reset": true,
+              "activeCount": 5
+            }
+          ],
+          "sent": [
+            "",
+            ""
+          ],
+          "ids": [
+            "a",
+            "b"
+          ]
+        },
+        {
+          "answers": [
+            {
+              "items": [],
+              "removedIds": [],
+              "cursor": "2:0:0",
+              "reset": false,
+              "activeCount": 2
+            }
+          ],
+          "sent": [
+            "2:0:0"
+          ],
+          "ids": [
+            "a",
+            "b"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "a session without a count: pages, then a closing delta and empty deltas without activeCount",
+      "steps": [
+        {
+          "answers": [
+            {
+              "items": [
+                {
+                  "id": "a",
+                  "type": "freehand",
+                  "createdAt": 1,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                }
+              ],
+              "removedIds": [],
+              "cursor": "4:0:0",
+              "reset": true,
+              "activeCount": 1,
+              "nextPageToken": "p2.1.5"
+            },
+            {
+              "items": [
+                {
+                  "id": "b",
+                  "type": "freehand",
+                  "createdAt": 1,
+                  "points": [
+                    {
+                      "x": 0.1,
+                      "y": 0.2
+                    },
+                    {
+                      "x": 0.3,
+                      "y": 0.4
+                    }
+                  ]
+                }
+              ],
+              "removedIds": [],
+              "cursor": "4:0:0",
+              "reset": false,
+              "activeCount": 1
+            },
+            {
+              "items": [],
+              "removedIds": [],
+              "cursor": "4:0:0",
+              "reset": false
+            }
+          ],
+          "sent": [
+            "",
+            "4:0:0",
+            "4:0:0"
+          ],
+          "pageTokens": [
+            null,
+            "p2.1.5",
+            null
+          ],
+          "ids": [
+            "a",
+            "b"
+          ]
+        },
+        {
+          "answers": [
+            {
+              "items": [],
+              "removedIds": [],
+              "cursor": "4:0:0",
+              "reset": false
+            }
+          ],
+          "sent": [
+            "4:0:0"
+          ],
+          "pageTokens": [
+            null
+          ],
+          "ids": [
+            "a",
+            "b"
+          ]
+        }
+      ]
+    }
+  ]
+}

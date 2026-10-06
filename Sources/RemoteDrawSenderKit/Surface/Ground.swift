@@ -63,7 +63,7 @@ public struct RemoteDrawGroundContext {
 public struct RemoteDrawUnsupportedSurface: Equatable, Sendable, Identifiable {
   public enum Reason: Equatable, Sendable {
     /// The session asked for a streaming sender — `senderIntegrationMode:
-    /// "streaming"`, or a receiver publishing `visualContext.enabled` — and
+    /// "streaming"`, or a legacy response with no mode and live view enabled — and
     /// this package has no WebRTC, no video and no `WKWebView`. That is a
     /// deliberate dependency choice (`Package.swift`: zero external
     /// dependencies), not an oversight, so it is reported rather than

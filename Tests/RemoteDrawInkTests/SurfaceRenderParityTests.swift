@@ -46,8 +46,8 @@ final class SurfaceRenderParityTests: XCTestCase {
   /// Chosen so that every arm of `drawStroke` is exercised in one image: a dry
   /// medium with a tooth and a capacity ceiling, a wet opaque one, a
   /// translucent multiply, a flat nib, a broad-edge nib, tilt-driven width, a
-  /// scattered instrument, a snapped shape, an arrow, a dot, text, and a fill
-  /// wash. A parity test that only draws one pencil line proves one branch.
+  /// scattered instrument, a snapped shape, an opaque and a translucent arrow,
+  /// a grain rectangle, a dot, text, and a fill wash. A parity test that only draws one pencil line proves one branch.
   private func subjects() -> [(
     id: String, type: String, text: String?, style: RemoteDrawDrawingStyle,
     points: [NormalizedPoint], lineWidth: CGFloat
@@ -86,6 +86,21 @@ final class SurfaceRenderParityTests: XCTestCase {
       (
         "arrow", "arrow", nil, style(.fineliner, width: 4),
         [NormalizedPoint(x: 0.66, y: 0.94), NormalizedPoint(x: 0.94, y: 0.82)], 4
+      ),
+      // A translucent arrow composites its shaft and head as one mark, and a
+      // dry-media rectangle runs its grain round the closed outline; both are
+      // branches an opaque arrow and a ballpoint rectangle never reach.
+      (
+        "arrow-highlighter", "arrow", nil, style(.highlighter, width: 12),
+        [NormalizedPoint(x: 0.06, y: 0.985), NormalizedPoint(x: 0.34, y: 0.965)], 12
+      ),
+      (
+        "chalk-rect", "rectangle", nil,
+        filled(.chalk, width: 8),
+        [
+          NormalizedPoint(x: 0.40, y: 0.006), NormalizedPoint(x: 0.62, y: 0.006),
+          NormalizedPoint(x: 0.62, y: 0.042), NormalizedPoint(x: 0.40, y: 0.042),
+        ], 8
       ),
       ("dot", "point", nil, style(.ink, width: 6), [NormalizedPoint(x: 0.90, y: 0.06)], 6),
       (
@@ -153,6 +168,39 @@ final class SurfaceRenderParityTests: XCTestCase {
       worst = max(worst, abs(Int(first[index]) - Int(second[index])))
     }
     print("=== harness self-render: \(differing) of \(first.count) differ, worst \(worst)/255 ===")
+  }
+
+  func testZoomedOutInkKeepsItsFullMaskAndDoesNotDisappear() throws {
+    let size = CGSize(width: extent, height: extent)
+    // The former implementation put these points at 4–9 normalized units
+    // but kept a 0–1 mask, clipping the entire stroke at maximum zoom-out.
+    let points = [NormalizedPoint(x: 0.4, y: 0.8, t: 0, pressure: 0.7),
+      NormalizedPoint(x: 0.9, y: 0.8, t: 120, pressure: 0.7)]
+    let ink = style(.whiteboardMarker, width: 24)
+    let scale = 0.1
+    // The opaque harness returned identical black bitmaps for this transparent
+    // scene with and without ink. Give all three images the same explicit white
+    // backdrop so visibility is tested against a defined ground; the canvas
+    // itself stays transparent and both original ink assertions stay intact.
+    func onBackdrop<V: View>(_ view: V) throws -> [UInt8] {
+      try renderView(ZStack {
+        Color.white
+        view
+      }.frame(width: size.width, height: size.height))
+    }
+    let actual = try onBackdrop(RemoteDrawBoardCanvas(ground: .transparent,
+      surface: .whiteboard, sections: [RemoteDrawBoardSection(marks: [
+        RemoteDrawBoardMark(id: "live", points: points, style: ink)
+      ]).withContentPixelScale(scale)]))
+    let expected = try onBackdrop(Canvas(rendersAsynchronously: false) { context, _ in
+      context.scaleBy(x: scale, y: scale)
+      RemoteDrawStrokePainter.draw(.init(points: points, style: ink), in: &context,
+        size: CGSize(width: size.width / scale, height: size.height / scale), surface: .whiteboard,
+        dynamicsScale: CGSize(width: size.width / scale / 1000, height: size.height / scale / 1000))
+    })
+    XCTAssertEqual(actual, expected, "zoom must transform the full canonical ink pass")
+    let empty = try onBackdrop(RemoteDrawBoardCanvas(ground: .transparent, sections: []))
+    XCTAssertNotEqual(actual, empty, "zoomed-out live ink must remain visible")
   }
 
   /// Exactly the wet instruments differ on paper, and nothing else does.
@@ -545,7 +593,12 @@ final class SurfaceRenderParityTests: XCTestCase {
 
     RemoteDrawPaperGround.prepareTile(grain: RemoteDrawInkSurface.grain(surface))
     RemoteDrawInk.prepareToothImage(for: surface, extent: extent)
-    let deadline = Date().addingTimeInterval(10)
+    // A dry mark now has both a physical tooth mask and a material-capacity
+    // mask. Warming only tooth compares one side with a partially built cache.
+    let textures = Set(subjects().compactMap {
+      RemoteDrawInk.film(for: DrawingStyleKind(rawValue: $0.style.kind ?? ""), surface: surface)?.capacity?.texture
+    })
+    let deadline = Date().addingTimeInterval(30)
     while Date() < deadline {
       let tileReady =
         RemoteDrawInkSurface.grain(surface) == nil
@@ -553,10 +606,14 @@ final class SurfaceRenderParityTests: XCTestCase {
       let toothReady =
         RemoteDrawInkSurface.tooth(surface) == nil
         || RemoteDrawInk.toothImage(for: surface, extent: extent) != nil
-      if tileReady && toothReady { return }
+      // Evaluate every mode on every pass so all builds are enqueued together.
+      let capacitiesReady = textures.map {
+        RemoteDrawInk.capacityImage(for: surface, extent: extent, texture: $0) != nil
+      }.allSatisfy { $0 }
+      if tileReady && toothReady && capacitiesReady { return }
       RunLoop.current.run(until: Date().addingTimeInterval(0.02))
     }
-    throw XCTSkip("The paper and tooth fields did not rasterise within 10s.")
+    throw XCTSkip("The paper, tooth and material fields did not rasterise within 30s.")
   }
 
   private func render(

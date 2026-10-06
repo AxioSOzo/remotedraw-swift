@@ -1,3 +1,4 @@
+import Combine
 import XCTest
 
 @testable import RemoteDrawSenderKit
@@ -21,6 +22,159 @@ final class SessionTests: XCTestCase {
         lastSequence: lastSequence, session: .stub(capabilities: capabilities)))
     return try await RemoteDrawSenderSession.join(
       token: .join("rd_join_abc"), transport: transport, tokenProvider: tokenProvider)
+  }
+
+  func testSnapshotBeforeAcknowledgmentDoesNotReinsertEcho() async throws {
+    let transport = FakeTransport()
+    let session = RemoteDrawSenderSession.adopt(
+      senderToken: "rd_send_1", transport: transport, senderId: "sender_1",
+      capabilities: ["draw", "undo", "clear", "viewExisting"],
+      automaticallyRefreshDrawings: false)
+    transport.commitAsyncHook = { _ in
+      session.reconcileDrawingIDs(["drawing_1"])
+    }
+    session.begin(stroke: "client-1", tool: .freehand)
+    session.append([sample(0.1, 0.1), sample(0.9, 0.9)])
+    _ = try await session.end(stroke: "client-1")
+    XCTAssertTrue(session.strokes.isEmpty)
+    XCTAssertEqual(session.drawingOperations["client-1"], .acknowledged)
+  }
+
+  func testSnapshotRemovalBeforeAcknowledgmentDoesNotResurrectEcho() async throws {
+    let transport = FakeTransport()
+    let session = RemoteDrawSenderSession.adopt(
+      senderToken: "rd_send_1", transport: transport, senderId: "sender_1",
+      capabilities: ["draw", "undo", "clear", "viewExisting"],
+      automaticallyRefreshDrawings: false)
+    transport.commitAsyncHook = { _ in
+      session.reconcileDrawingIDs(["drawing_1"])
+      session.reconcileDrawingIDs([])
+    }
+    session.begin(stroke: "client-1", tool: .freehand)
+    session.append([sample(0.1, 0.1), sample(0.9, 0.9)])
+    _ = try await session.end(stroke: "client-1")
+    XCTAssertTrue(session.strokes.isEmpty)
+    XCTAssertEqual(session.drawingOperations["client-1"], .removed)
+  }
+
+  func testUndoBeforeSnapshotRemovesAcknowledgedEcho() async throws {
+    let transport = FakeTransport()
+    let session = RemoteDrawSenderSession.adopt(
+      senderToken: "rd_send_1", transport: transport, senderId: "sender_1",
+      capabilities: ["draw", "undo", "clear", "viewExisting"],
+      automaticallyRefreshDrawings: false)
+    transport.undoResult = RemoteDrawUndoResult(removed: true, drawingId: "drawing_1")
+    session.begin(stroke: "client-1", tool: .freehand)
+    session.append([sample(0.1, 0.1), sample(0.9, 0.9)])
+    _ = try await session.end(stroke: "client-1")
+    _ = try await session.undo()
+    session.reconcileDrawingIDs([])
+    XCTAssertTrue(session.strokes.isEmpty)
+    XCTAssertEqual(session.drawingOperations["client-1"], .removed)
+  }
+
+  func testPermanentCommitFailureRemovesPreview() async throws {
+    let transport = FakeTransport()
+    let session = RemoteDrawSenderSession.adopt(
+      senderToken: "rd_send_1", transport: transport, senderId: "sender_1",
+      capabilities: ["draw", "undo", "clear", "viewExisting"],
+      automaticallyRefreshDrawings: false)
+    transport.commitResult = .failure(RemoteDrawError.server(
+      status: 400, code: "invalid_points", message: "Invalid points"))
+    session.begin(stroke: "client-1", tool: .freehand)
+    session.append([sample(0.1, 0.1), sample(0.9, 0.9)])
+    do { _ = try await session.end(stroke: "client-1"); XCTFail("Expected failure") }
+    catch {}
+    XCTAssertTrue(session.strokes.isEmpty)
+    XCTAssertEqual(session.drawingOperations["client-1"], .failed)
+    XCTAssertEqual(session.pendingCommitCount, 0)
+  }
+
+  func testUncertainDeliveryStaysPendingUntilRetryAcknowledgesIt() async throws {
+    let transport = FakeTransport()
+    let session = RemoteDrawSenderSession.adopt(
+      senderToken: "rd_send_1", transport: transport, senderId: "sender_1",
+      capabilities: ["draw", "undo", "clear", "viewExisting"],
+      automaticallyRefreshDrawings: false)
+    transport.commitResult = .failure(RemoteDrawError.offline)
+    session.begin(stroke: "client-1", tool: .freehand)
+    session.append([sample(0.1, 0.1), sample(0.9, 0.9)])
+    do { _ = try await session.end(stroke: "client-1"); XCTFail("Expected failure") }
+    catch {}
+    XCTAssertEqual(session.drawingOperations["client-1"], .pending)
+    XCTAssertEqual(session.strokes.count, 1)
+    XCTAssertTrue(session.strokes[0].isLocalEcho)
+    session.reconcileDrawingIDs([])
+    XCTAssertEqual(session.strokes.count, 1)
+    transport.commitResult = nil
+    await session.retryPendingCommits()
+    XCTAssertEqual(session.drawingOperations["client-1"], .acknowledged)
+    XCTAssertEqual(session.pendingCommitCount, 0)
+  }
+
+  func testReadStartedBeforeCommitDoesNotRemoveNewAcknowledgment() async throws {
+    let transport = FakeTransport()
+    let session = RemoteDrawSenderSession.adopt(
+      senderToken: "rd_send_1", transport: transport, senderId: "sender_1",
+      capabilities: ["draw", "undo", "clear", "viewExisting"],
+      automaticallyRefreshDrawings: false)
+    let beforeRead = session.acknowledgedOperationIDs
+    session.begin(stroke: "client-1", tool: .freehand)
+    session.append([sample(0.1, 0.1), sample(0.9, 0.9)])
+    _ = try await session.end(stroke: "client-1")
+    session.reconcileDrawingIDs([], acknowledgedBeforeRead: beforeRead)
+    XCTAssertEqual(session.strokes.count, 1)
+    session.reconcileDrawingIDs([], acknowledgedBeforeRead: session.acknowledgedOperationIDs)
+    XCTAssertTrue(session.strokes.isEmpty)
+    XCTAssertEqual(session.drawingOperations["client-1"], .removed)
+  }
+
+  func testTextSnapshotBeforeAcknowledgmentDoesNotReinsertEcho() async throws {
+    let transport = FakeTransport()
+    let session = RemoteDrawSenderSession.adopt(
+      senderToken: "rd_send_1", transport: transport, senderId: "sender_1",
+      capabilities: ["draw", "undo", "clear", "viewExisting"],
+      automaticallyRefreshDrawings: false)
+    transport.commitAsyncHook = { _ in session.reconcileDrawingIDs(["drawing_1"]) }
+    _ = try await session.commitText("Hello", at: sample(0.1, 0.1))
+    XCTAssertTrue(session.strokes.isEmpty)
+    XCTAssertEqual(Array(session.drawingOperations.values), [.acknowledged])
+  }
+
+  func testPendingPreviewUsesBoardMappingWithoutChangingWirePoints() async throws {
+    let transport = FakeTransport()
+    let session = RemoteDrawSenderSession.adopt(
+      senderToken: "rd_send_1", transport: transport, senderId: "sender_1",
+      capabilities: ["draw", "undo", "clear", "viewExisting"],
+      automaticallyRefreshDrawings: false)
+    session.strokeSpace = {
+      RemoteDrawStrokeSpace(isBoardSpace: true, boardPreview: { points in
+        points.map { RemoteDrawNormalizedPoint(x: $0.x / 2, y: $0.y / 2, t: $0.t) }
+      })
+    }
+    transport.commitAsyncHook = { request in
+      XCTAssertTrue(session.strokes[0].isBoardSpace)
+      XCTAssertEqual(session.strokes[0].points[0].x, 0.1, accuracy: 0.001)
+      let points = try PointCodec.unpack(request.packedPoints)
+      XCTAssertEqual(points[0].x, 0.2, accuracy: 0.001)
+    }
+    session.begin(stroke: "client-1", tool: .freehand)
+    session.append([sample(0.2, 0.2), sample(0.8, 0.8)])
+    _ = try await session.end(stroke: "client-1")
+  }
+
+  func testTextFailureRemovesPreview() async throws {
+    let transport = FakeTransport()
+    let session = RemoteDrawSenderSession.adopt(
+      senderToken: "rd_send_1", transport: transport, senderId: "sender_1",
+      capabilities: ["draw", "undo", "clear", "viewExisting"],
+      automaticallyRefreshDrawings: false)
+    transport.commitResult = .failure(RemoteDrawError.server(
+      status: 400, code: "invalid_text", message: "Invalid text"))
+    do { _ = try await session.commitText("Hello", at: sample(0.1, 0.1)); XCTFail("Expected failure") }
+    catch {}
+    XCTAssertTrue(session.strokes.isEmpty)
+    XCTAssertEqual(Array(session.drawingOperations.values), [.failed])
   }
 
   // MARK: - Entering
@@ -180,6 +334,424 @@ final class SessionTests: XCTestCase {
 
   // MARK: - Cadence
 
+  func testRejectedSamplesDoNotSendOrPublishAnUnchangedStroke() async throws {
+    let transport = FakeTransport()
+    let session = try await joined(transport)
+    defer { session.leave() }
+    session.recordsDraftDiagnostics = true
+    session.begin(stroke: "still")
+    session.append([sample(0.1, 0.1)])
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 1)
+
+    var publications = 0
+    let observation = session.$live.dropFirst().sink { _ in publications += 1 }
+    defer { observation.cancel() }
+    // Each append runs after the prior draft's cadence has elapsed, so a
+    // redundant re-offer would start another request rather than coalesce.
+    for _ in 0..<3 {
+      session.append([sample(0.1, 0.1)])
+      await settle()
+    }
+    XCTAssertEqual(transport.callCount(.draft), 1)
+    XCTAssertEqual(publications, 0)
+    XCTAssertEqual(session.draftDiagnostics.offered, 1)
+
+    session.append([sample(0.5, 0.5)])
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 2)
+    XCTAssertEqual(publications, 1)
+    XCTAssertEqual(session.draftDiagnostics.offered, 2)
+    XCTAssertEqual(session.live?.points.count, 2)
+  }
+
+  func testUnchangedInputRenewsTheDraftAtFiveSecondsWithoutPublication() async throws {
+    let transport = FakeTransport()
+    let automaticClock = transport.holdAutomaticPolling()
+    let clock = ManualPollClock()
+    let session = RemoteDrawSenderSession.adopt(
+      senderToken: "rd_send_1", transport: transport, senderId: "sender_1",
+      session: .stub(capabilities: ["draw"]), automaticallyRefreshDrawings: false,
+      pollClock: clock)
+    defer { session.stopLocally() }
+    await automaticClock.settle()
+    session.recordsDraftDiagnostics = true
+    session.begin(stroke: "held")
+    session.append([sample(0.1, 0.1)])
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 1)
+    let packed = transport.lastDraftPacked
+    var publications = 0
+    let observation = session.$live.dropFirst().sink { _ in publications += 1 }
+    defer { observation.cancel() }
+
+    // Binary-exact increments exercise the boundary without accumulated decimal
+    // rounding making the second renewal land just below ten seconds.
+    await clock.advance(by: 4.875)
+    session.append([sample(0.1, 0.1)])
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 1)
+    await clock.advance(by: 0.125)
+    session.append([sample(0.1, 0.1)])
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 2)
+    session.append([sample(0.1, 0.1)])
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 2)
+
+    await clock.advance(by: 4.875)
+    session.append([sample(0.1, 0.1)])
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 2)
+    await clock.advance(by: 0.125)
+    session.append([sample(0.1, 0.1)])
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 3)
+    XCTAssertEqual(transport.lastDraftPacked, packed)
+    XCTAssertEqual(publications, 0)
+    XCTAssertEqual(session.draftDiagnostics.offered, 1)
+    XCTAssertEqual(session.draftDiagnostics.sent, 3)
+  }
+
+  func testUnchangedRenewalDoesNotQueueBehindAnInFlightDraft() async throws {
+    let transport = FakeTransport()
+    let automaticClock = transport.holdAutomaticPolling()
+    let clock = ManualPollClock()
+    let gate = DraftCompletionGate()
+    transport.draftHook = { await gate.wait() }
+    let session = RemoteDrawSenderSession.adopt(
+      senderToken: "rd_send_1", transport: transport, senderId: "sender_1",
+      session: .stub(capabilities: ["draw"]), automaticallyRefreshDrawings: false,
+      pollClock: clock)
+    defer { session.stopLocally() }
+    await automaticClock.settle()
+    session.begin(stroke: "pending")
+    session.append([sample(0.1, 0.1)])
+    await settle()
+    await clock.advance(by: 5)
+    session.append([sample(0.1, 0.1)])
+    await gate.releaseAll()
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 1, "an unchanged offer must not become a pending frame")
+    transport.draftHook = nil
+    session.append([sample(0.1, 0.1)])
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 2)
+  }
+
+  func testUnchangedRenewalHonorsHTTPRetryAfter() async throws {
+    let transport = FakeTransport()
+    let automaticClock = transport.holdAutomaticPolling()
+    let clock = ManualPollClock()
+    transport.draftError = RemoteDrawError.rateLimited(retryAfter: 20, bucket: "sender_writes")
+    let session = RemoteDrawSenderSession.adopt(
+      senderToken: "rd_send_1", transport: transport, senderId: "sender_1",
+      session: .stub(capabilities: ["draw"]), automaticallyRefreshDrawings: false,
+      pollClock: clock)
+    defer { session.stopLocally() }
+    await automaticClock.settle()
+    session.begin(stroke: "limited")
+    session.append([sample(0.1, 0.1)])
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 1)
+    await clock.advance(by: 5)
+    session.append([sample(0.1, 0.1)])
+    await settle()
+    await clock.advance(by: 14.999)
+    session.append([sample(0.1, 0.1)])
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 1)
+    await clock.advance(by: 0.001)
+    transport.draftError = nil
+    session.append([sample(0.1, 0.1)])
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 2)
+  }
+
+  func testCancelledDraftRefusalStillLimitsTheNextStrokesUnchangedRenewal() async throws {
+    let transport = FakeTransport()
+    let automaticClock = transport.holdAutomaticPolling()
+    let clock = ManualPollClock()
+    let gate = DraftCompletionGate()
+    transport.draftHook = {
+      await gate.wait()
+      throw RemoteDrawError.rateLimited(retryAfter: 20, bucket: "sender_writes")
+    }
+    let session = RemoteDrawSenderSession.adopt(
+      senderToken: "rd_send_1", transport: transport, senderId: "sender_1",
+      session: .stub(capabilities: ["draw"]), automaticallyRefreshDrawings: false,
+      pollClock: clock)
+    defer { session.stopLocally() }
+    await automaticClock.settle()
+    session.recordsDraftDiagnostics = true
+    session.begin(stroke: "first")
+    session.append([sample(0.1, 0.1)])
+    await gate.waitForEntry()
+    _ = try await session.end(stroke: "first")
+
+    // The first request ignores cancellation and finishes after the next
+    // stroke's first frame. Only that late refusal's renewal wait survives.
+    transport.draftHook = nil
+    session.begin(stroke: "second")
+    session.append([sample(0.2, 0.2)])
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 2)
+    await clock.advance(by: 1)
+    await gate.releaseAll()
+    await settle()
+    XCTAssertEqual(session.draftDiagnostics.failed, 1)
+    XCTAssertNil(session.lastError, "a canceled drain must not recover or publish an error")
+
+    await clock.advance(by: 4)
+    session.append([sample(0.2, 0.2)])
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 2, "five-second renewal must respect the late refusal")
+    await clock.advance(by: 15.875)
+    session.append([sample(0.2, 0.2)])
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 2)
+    await clock.advance(by: 0.125)
+    session.append([sample(0.2, 0.2)])
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 3, "Retry-After starts when the refusal arrives")
+  }
+
+  func testCancelledOldCredentialRefusalCannotLimitTheRotatedCredentialsRenewal() async throws {
+    let transport = FakeTransport()
+    let automaticClock = transport.holdAutomaticPolling()
+    let clock = ManualPollClock()
+    let gate = DraftCompletionGate()
+    transport.draftHook = {
+      await gate.wait()
+      throw RemoteDrawError.rateLimited(retryAfter: 30, bucket: "sender_writes")
+    }
+    transport.refreshResult = .success(RemoteDrawRefreshResponse(
+      senderToken: "rd_send_rotated", senderId: "sender_1",
+      capabilities: ["draw"], lastSequence: 2))
+    let session = RemoteDrawSenderSession.adopt(
+      senderToken: "rd_send_1", transport: transport, senderId: "sender_1",
+      session: .stub(capabilities: ["draw"]), automaticallyRefreshDrawings: false,
+      pollClock: clock)
+    defer { session.stopLocally() }
+    await automaticClock.settle()
+    session.begin(stroke: "old")
+    session.append([sample(0.1, 0.1)])
+    await gate.waitForEntry()
+    _ = try await session.end(stroke: "old")
+    let recovered = await session.recoverRejectedCredential("rd_send_1")
+    XCTAssertTrue(recovered)
+
+    transport.draftHook = nil
+    session.begin(stroke: "rotated")
+    session.append([sample(0.2, 0.2)])
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 2)
+    await clock.advance(by: 1)
+    await gate.releaseAll()
+    await settle()
+    await clock.advance(by: 4)
+    session.append([sample(0.2, 0.2)])
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 3, "the old credential's refusal must not floor the current one")
+    XCTAssertEqual(transport.calls.last { $0.route == .draft }?.senderToken, "rd_send_rotated")
+    XCTAssertNil(session.lastError)
+  }
+
+  func testHTTPDraftRefusalWaitsForItsFullFloorAndSendsOnlyLatestGeometry() async throws {
+    let transport = FakeTransport()
+    let automaticClock = transport.holdAutomaticPolling()
+    let clock = ManualPollClock()
+    transport.draftError = RemoteDrawError.rateLimited(retryAfter: 90, bucket: "sender_writes")
+    let session = RemoteDrawSenderSession.adopt(
+      senderToken: "rd_send_1", transport: transport, senderId: "sender_1",
+      session: .stub(capabilities: ["draw"]), automaticallyRefreshDrawings: false,
+      pollClock: clock)
+    defer { session.stopLocally() }
+    await automaticClock.settle()
+    let backgroundSleepers = clock.sleeperCount
+    session.begin(stroke: "quota")
+    session.append([sample(0.1, 0.1)])
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 1)
+    transport.draftError = nil
+    session.append([sample(0.3, 0.3)])
+    await clock.settle()
+    session.append([sample(0.8, 0.8)])
+    await clock.settle()
+    XCTAssertEqual(clock.sleeperCount, backgroundSleepers + 1)
+
+    // Long HTTP floors retain their full duration across bounded sleeps.
+    await clock.advance(by: 60)
+    XCTAssertEqual(transport.callCount(.draft), 1)
+    await clock.advance(by: 29.875)
+    XCTAssertEqual(transport.callCount(.draft), 1)
+    await clock.advance(by: 0.125)
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 2)
+    let sent = try PointCodec.unpack(XCTUnwrap(transport.lastDraftPacked))
+    XCTAssertEqual(sent.count, 3)
+    XCTAssertEqual(sent.last?.x ?? 0, 0.8, accuracy: 1.0 / 65535)
+    XCTAssertEqual(clock.sleeperCount, backgroundSleepers)
+    session.stopLocally()
+    await clock.settle()
+    XCTAssertEqual(clock.sleeperCount, 0)
+  }
+
+  func testTextHTTPRefusalDropsTextAndWaitsLatestGeometryUntilTheSameFloor() async throws {
+    let transport = FakeTransport()
+    let automaticClock = transport.holdAutomaticPolling()
+    let clock = ManualPollClock()
+    transport.draftError = RemoteDrawError.rateLimited(retryAfter: 20, bucket: "sender_writes")
+    let session = RemoteDrawSenderSession.adopt(
+      senderToken: "rd_send_1", transport: transport, senderId: "sender_1",
+      session: .stub(capabilities: ["draw"]), automaticallyRefreshDrawings: false,
+      pollClock: clock)
+    defer { session.stopLocally() }
+    await automaticClock.settle()
+    let point = RemoteDrawNormalizedPoint(x: 0.4, y: 0.4)
+    await session.draftText("first", at: point)
+    XCTAssertEqual(transport.callCount(.draft), 1)
+    transport.draftError = nil
+    await session.draftText("dropped", at: point)
+    session.begin(stroke: "after-text")
+    session.append([sample(0.2, 0.2)])
+    session.append([sample(0.8, 0.8)])
+    await clock.settle()
+    await clock.advance(by: 19.875)
+    await session.draftText("still dropped", at: point)
+    XCTAssertEqual(transport.callCount(.draft), 1)
+    await clock.advance(by: 0.125)
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 2)
+    let sent = try PointCodec.unpack(XCTUnwrap(transport.lastDraftPacked))
+    XCTAssertEqual(sent.count, 2)
+    XCTAssertEqual(sent.last?.x ?? 0, 0.8, accuracy: 1.0 / 65535)
+    await session.draftText("after floor", at: point)
+    XCTAssertEqual(transport.callCount(.draft), 3)
+  }
+
+  func testHTTPDraftFloorLeavesStrokeAndTextCommitsAvailable() async throws {
+    let transport = FakeTransport()
+    let automaticClock = transport.holdAutomaticPolling()
+    let clock = ManualPollClock()
+    transport.draftError = RemoteDrawError.rateLimited(retryAfter: 30, bucket: "sender_writes")
+    let session = RemoteDrawSenderSession.adopt(
+      senderToken: "rd_send_1", transport: transport, senderId: "sender_1",
+      session: .stub(capabilities: ["draw"]), automaticallyRefreshDrawings: false,
+      pollClock: clock)
+    defer { session.stopLocally() }
+    await automaticClock.settle()
+    let backgroundSleepers = clock.sleeperCount
+    session.begin(stroke: "commit")
+    session.append([sample(0.1, 0.1)])
+    await settle()
+    transport.draftError = nil
+    session.append([sample(0.8, 0.8)])
+    await clock.settle()
+    XCTAssertEqual(clock.sleeperCount, backgroundSleepers + 1)
+    let stroke = try await session.end(stroke: "commit")
+    XCTAssertNotNil(stroke)
+    XCTAssertEqual(transport.callCount(.commit), 1)
+    let point = RemoteDrawNormalizedPoint(x: 0.4, y: 0.4)
+    await session.draftText("dropped", at: point)
+    _ = try await session.commitText("committed", at: point)
+    await clock.settle()
+    XCTAssertEqual(transport.callCount(.commit), 2)
+    XCTAssertEqual(transport.callCount(.draft), 1)
+    XCTAssertEqual(clock.now, 0)
+    XCTAssertEqual(clock.sleeperCount, backgroundSleepers, "pen-up must cancel the queued quota wait")
+    session.stopLocally()
+    await clock.settle()
+    XCTAssertEqual(clock.sleeperCount, 0)
+  }
+
+  func testCredentialRotationWakesHTTPWaitWithOnlyLatestPendingGeometry() async throws {
+    let transport = FakeTransport()
+    let automaticClock = transport.holdAutomaticPolling()
+    let clock = ManualPollClock()
+    transport.draftError = RemoteDrawError.rateLimited(retryAfter: 30, bucket: "sender_writes")
+    transport.refreshResult = .success(RemoteDrawRefreshResponse(
+      senderToken: "rd_send_rotated", senderId: "sender_1",
+      capabilities: ["draw"], lastSequence: 1))
+    let session = RemoteDrawSenderSession.adopt(
+      senderToken: "rd_send_1", transport: transport, senderId: "sender_1",
+      session: .stub(capabilities: ["draw"]), automaticallyRefreshDrawings: false,
+      pollClock: clock)
+    defer { session.stopLocally() }
+    await automaticClock.settle()
+    let backgroundSleepers = clock.sleeperCount
+    session.begin(stroke: "rotating")
+    session.append([sample(0.1, 0.1)])
+    await settle()
+    transport.draftError = nil
+    session.append([sample(0.3, 0.3)])
+    await clock.settle()
+    session.append([sample(0.8, 0.8)])
+    await clock.settle()
+    XCTAssertEqual(clock.sleeperCount, backgroundSleepers + 1)
+    let recovered = await session.recoverRejectedCredential("rd_send_1")
+    XCTAssertTrue(recovered)
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 2)
+    XCTAssertEqual(transport.calls.last { $0.route == .draft }?.senderToken, "rd_send_rotated")
+    let sent = try PointCodec.unpack(XCTUnwrap(transport.lastDraftPacked))
+    XCTAssertEqual(sent.count, 3)
+    XCTAssertEqual(sent.last?.x ?? 0, 0.8, accuracy: 1.0 / 65535)
+    XCTAssertEqual(clock.now, 0, "rotation must not wait out the previous credential's floor")
+    XCTAssertEqual(clock.sleeperCount, backgroundSleepers)
+    session.stopLocally()
+    await clock.settle()
+    XCTAssertEqual(clock.sleeperCount, 0)
+  }
+
+  func testInactiveHTTPWaitPreservesLatestGeometryAndTheFloorUntilActivation() async throws {
+    let transport = FakeTransport()
+    let automaticClock = transport.holdAutomaticPolling()
+    let clock = ManualPollClock()
+    transport.draftError = RemoteDrawError.rateLimited(retryAfter: 30, bucket: "sender_writes")
+    let session = RemoteDrawSenderSession.adopt(
+      senderToken: "rd_send_1", transport: transport, senderId: "sender_1",
+      session: .stub(capabilities: ["draw"]), automaticallyRefreshDrawings: false,
+      pollClock: clock)
+    defer { session.stopLocally() }
+    await automaticClock.settle()
+    session.begin(stroke: "paused")
+    session.append([sample(0.1, 0.1)])
+    await settle()
+    transport.draftError = nil
+    session.append([sample(0.3, 0.3)])
+    session.append([sample(0.8, 0.8)])
+    await clock.settle()
+    XCTAssertEqual(transport.callCount(.draft), 1)
+    await session.markInactive()
+    await clock.settle()
+    XCTAssertEqual(clock.sleeperCount, 0, "backgrounding must cancel the HTTP waiter and heartbeat")
+
+    // An early activation keeps the original credential's complete floor.
+    await clock.advance(by: 5)
+    await session.markActive()
+    await clock.settle()
+    XCTAssertEqual(transport.callCount(.draft), 1)
+    session.append([sample(0.9, 0.9)])
+    await session.markInactive()
+    await clock.settle()
+    XCTAssertEqual(clock.sleeperCount, 0)
+
+    // Expiry alone cannot send a queued frame while the sender is inactive.
+    await clock.advance(by: 25)
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 1)
+    await session.markActive()
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 2)
+    let sent = try PointCodec.unpack(XCTUnwrap(transport.lastDraftPacked))
+    XCTAssertEqual(sent.count, 4)
+    XCTAssertEqual(sent.last?.x ?? 0, 0.9, accuracy: 1.0 / 65535)
+    session.stopLocally()
+    await clock.settle()
+    XCTAssertEqual(clock.sleeperCount, 0)
+  }
+
   func testDraftsAreNeverSentFasterThanTheProtocolCadence() async throws {
     // 31.25 Hz is the number PERFORMANCE_BUDGETS pins. Faster does not make the
     // board smoother; it spends the sender's rate-limit budget on frames nobody
@@ -221,6 +793,73 @@ final class SessionTests: XCTestCase {
     XCTAssertEqual(
       points.count, 10,
       "the frame that went out must carry the whole stroke as it stands, not one queued slice")
+  }
+
+  func testDelayedCancellationCannotAbandonANewerStroke() async throws {
+    let session = try await joined(FakeTransport())
+    session.begin(stroke: "old")
+    session.append([sample(0.1, 0.1)])
+    session.begin(stroke: "new")
+    session.append([sample(0.6, 0.7)])
+    await session.cancelStroke(stroke: "old")
+    XCTAssertEqual(session.live?.id, "new")
+    XCTAssertEqual(session.live?.points.count, 1)
+    await session.cancelStroke(stroke: "new")
+    XCTAssertNil(session.live)
+    session.leave()
+  }
+
+  func testCanceledTransportCannotClearTheNextStrokesDraftDrain() async throws {
+    let transport = FakeTransport()
+    let gate = DraftCompletionGate()
+    transport.draftHook = { await gate.wait() }
+    let session = try await joined(transport)
+    session.begin(stroke: "first")
+    session.append([sample(0.1, 0.1)])
+    await settle()
+    await session.cancelStroke()
+    session.begin(stroke: "second")
+    session.append([sample(0.2, 0.2)])
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 2)
+    // This fake deliberately completes despite cancellation, like an HTTP
+    // request already accepted by the server. Its defer must not release the
+    // newer drain, which is still waiting for its own response.
+    await gate.releaseFirst()
+    await settle()
+    session.append([sample(0.4, 0.4)])
+    await settle()
+    XCTAssertEqual(transport.callCount(.draft), 2)
+    await session.cancelStroke()
+    await gate.releaseAll()
+    session.leave()
+  }
+
+  func testDelayedHTTPDraftsMeasureRTTCeilingAndCommitSequenceOrdering() async throws {
+    for rtt: UInt64 in [100_000_000, 200_000_000] {
+      let transport = FakeTransport()
+      transport.draftDelayNanoseconds = rtt
+      let session = try await joined(transport)
+      session.begin(stroke: "latency")
+      for index in 0..<20 {
+        session.append([sample(Double(index) / 22, 0.4)])
+        try await Task.sleep(nanoseconds: 32_000_000)
+      }
+      let starts = transport.draftStartedAt
+      XCTAssertGreaterThanOrEqual(starts.count, 3)
+      for (previous, next) in zip(starts, starts.dropFirst()) {
+        XCTAssertGreaterThanOrEqual(next - previous, Double(rtt) / 1_000_000_000 * 0.9,
+          "one outstanding HTTP draft, latest-only: updates remain RTT-limited")
+      }
+      let measuredHz = Double(starts.count - 1) / (starts.last! - starts.first!)
+      print("Draft RTT baseline: \(rtt / 1_000_000) ms, \(String(format: "%.1f", measuredHz)) Hz")
+      _ = try await session.end(stroke: "latency")
+      let commit = try XCTUnwrap(transport.calls.last { $0.route == .commit })
+      XCTAssertTrue(transport.calls.filter { $0.route == .draft }.allSatisfy {
+        ($0.sequence ?? 0) < (commit.sequence ?? 0)
+      }, "reliable commit must carry a sequence newer than every live draft")
+      session.leave()
+    }
   }
 
   // MARK: - Strokes
@@ -343,6 +982,18 @@ final class SessionTests: XCTestCase {
     XCTAssertFalse(transport.calls.contains { $0.route == .undo })
     // A missing grant is not a broken credential: the session stays usable.
     XCTAssertEqual(session.phase, .ready)
+  }
+
+  func testSubmitNeedsNoCapabilityGrantBecauseTheServerNeverSendsOne() async throws {
+    // The real server's capability set has no "submit" (convex
+    // capabilityValidator); it accepts a submit from any live sender. A local
+    // grant check therefore refused every real submit with notPermitted.
+    let transport = FakeTransport()
+    let session = try await joined(transport, capabilities: ["draw", "undo", "clear"])
+
+    _ = try await session.submit()
+    XCTAssertEqual(session.phase, .submitted)
+    XCTAssertTrue(transport.calls.contains { $0.route == .submit })
   }
 
   func testSubmitIsIdempotentAcrossItsOwnRetries() async throws {
@@ -489,6 +1140,42 @@ final class SessionTests: XCTestCase {
     XCTAssertEqual(transport.calls.filter { $0.route == .join }.count, 1)
   }
 
+  func testAFinishedBoardPastItsOwnExpiryIsReportedAsExpired() async throws {
+    // The API answers `session_not_active` for both; the session holds the
+    // `expiresAt` it was given (the stub's is epoch + 1 s, long past), so the
+    // refusal is refined into the one a person can act on.
+    let transport = FakeTransport()
+    transport.draftError = RemoteDrawError.sessionEnded
+    let session = try await joined(transport)
+
+    session.begin(stroke: "s")
+    session.append([sample(0.2, 0.2)])
+    await settle()
+
+    XCTAssertEqual(session.phase, .ended(.ended))
+    XCTAssertEqual(session.lastError, .sessionExpired)
+  }
+
+  func testJoiningHeartbeatsAtOnceSoTheBoardSeesThePhoneArrive() async throws {
+    let transport = FakeTransport()
+    let session = try await joined(transport)
+    await settle()
+    XCTAssertEqual(transport.callCount(.ping), 1)
+    XCTAssertEqual(transport.lastPingWasActive, false)
+    // Held to here on purpose: the first beat is weak on the session, so a
+    // session nobody keeps sends nothing — which is the right behaviour, and
+    // is why a host that joins and drops the object sees no presence.
+    XCTAssertEqual(session.phase, .ready)
+  }
+
+  func testAnExplicitMarkActiveIsNotFollowedByADemotingBeat() async throws {
+    let transport = FakeTransport()
+    let session = try await joined(transport)
+    await session.markActive()
+    await settle()
+    XCTAssertEqual(transport.lastPingWasActive, true)
+  }
+
   // MARK: - Helpers
 
   private func sample(_ x: Double, _ y: Double) -> RemoteDrawSample {
@@ -499,5 +1186,30 @@ final class SessionTests: XCTestCase {
   /// wants to observe two frames has to wait out one interval.
   private func settle() async {
     try? await Task.sleep(nanoseconds: 60_000_000)
+  }
+}
+
+private actor DraftCompletionGate {
+  private var pending: [CheckedContinuation<Void, Never>] = []
+  private var entered = false
+  private var entryWaiters: [CheckedContinuation<Void, Never>] = []
+  func wait() async {
+    entered = true
+    let arrivals = entryWaiters
+    entryWaiters = []
+    for arrival in arrivals { arrival.resume() }
+    await withCheckedContinuation { pending.append($0) }
+  }
+  func waitForEntry() async {
+    if entered { return }
+    await withCheckedContinuation { entryWaiters.append($0) }
+  }
+  func releaseFirst() {
+    if !pending.isEmpty { pending.removeFirst().resume() }
+  }
+  func releaseAll() {
+    let completions = pending
+    pending = []
+    for completion in completions { completion.resume() }
   }
 }

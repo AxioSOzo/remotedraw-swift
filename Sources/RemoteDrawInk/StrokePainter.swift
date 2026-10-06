@@ -81,7 +81,8 @@ public enum RemoteDrawStrokePainter {
     in context: inout GraphicsContext,
     size: CGSize,
     defaults: Defaults = .standard,
-    surface: RemoteDrawInkSurface.Kind = RemoteDrawInkSurface.defaultKind
+    surface: RemoteDrawInkSurface.Kind = RemoteDrawInkSurface.defaultKind,
+    dynamicsScale: CGSize = CGSize(width: 1, height: 1)
   ) {
     let points = decimated(stroke.points)
     guard let first = points.first else { return }
@@ -137,7 +138,8 @@ public enum RemoteDrawStrokePainter {
         opacity: opacity,
         lineWidth: lineWidth,
         defaults: defaults,
-        surface: surface
+        surface: surface,
+        dynamicsScale: dynamicsScale
       )
     {
       return
@@ -163,6 +165,7 @@ public enum RemoteDrawStrokePainter {
         screenPoints: screenPoints,
         isFreehand: isFreehand,
         fillColor: fillColor,
+        surfaceExtent: surfaceExtent,
         in: &context
       )
     }
@@ -177,7 +180,8 @@ public enum RemoteDrawStrokePainter {
         lineWidth: lineWidth,
         size: size,
         in: &context,
-        surface: surface
+        surface: surface,
+        dynamicsScale: dynamicsScale
       )
     {
       return
@@ -222,7 +226,8 @@ public enum RemoteDrawStrokePainter {
     lineWidth: CGFloat,
     size: CGSize,
     in context: inout GraphicsContext,
-    surface: RemoteDrawInkSurface.Kind = RemoteDrawInkSurface.defaultKind
+    surface: RemoteDrawInkSurface.Kind = RemoteDrawInkSurface.defaultKind,
+    dynamicsScale: CGSize = CGSize(width: 1, height: 1)
   ) -> Bool {
     // The surface supplies the sheet and the instrument declares whether it
     // rides one, so a pencil on a whiteboard draws an even line rather than
@@ -266,13 +271,21 @@ public enum RemoteDrawStrokePainter {
       profile: profile,
       axisFactors: axisFactors,
       lineWidth: lineWidth,
-      surfaceExtent: surfaceExtent
+      surfaceExtent: surfaceExtent,
+      dynamicsScale: dynamicsScale
     )
+    // A shape's closed outline has no ends: no caps, no taper, and the curve
+    // wraps across the seam. See `InkRenderer.isClosedOutline`.
+    let closed = InkRenderer.isClosedOutline(screenPoints, extent: surfaceExtent)
+    let centerline =
+      closed
+      ? InkRenderer.closedSmoothPath(through: Array(screenPoints.dropLast()))
+      : InkRenderer.smoothPath(through: screenPoints)
 
     let paint: (inout GraphicsContext) -> Bool = { layer in
       if let glow = profile.glow {
         layer.stroke(
-          InkRenderer.smoothPath(through: screenPoints),
+          centerline,
           with: .color(markColor.opacity(glow.opacity)),
           style: StrokeStyle(lineWidth: lineWidth * glow.width, lineCap: .round, lineJoin: .round)
         )
@@ -296,7 +309,8 @@ public enum RemoteDrawStrokePainter {
           let streaks = InkRenderer.grainStreaks(
             centerline: screenPoints,
             widths: widths ?? [lineWidth],
-            grain: grain
+            grain: grain,
+            closed: closed
           )
         else { return false }
         for streak in streaks {
@@ -314,11 +328,21 @@ public enum RemoteDrawStrokePainter {
         return true
       }
 
-      if let widths,
-        let ribbon = InkRenderer.ribbonPath(
-          centerline: screenPoints,
-          halfWidths: widths.map { max($0 / 2, lineWidth * 0.04) }
-        )
+      // A dash shorter than a couple of nib widths is a capsule: it falls
+      // through to the uniform stroke below at the nominal nib. Not for a broad
+      // nib or a tilted pencil, whose width axis is real on a short mark too.
+      let capsule =
+        axisFactors == nil && InkRenderer.isShortStroke(screenPoints, lineWidth: lineWidth)
+      let halfWidths = widths?.map { max($0 / 2, lineWidth * 0.04) }
+      if let halfWidths, !capsule,
+        let ribbon = closed
+          ? InkRenderer.closedRibbonPath(centerline: screenPoints, halfWidths: halfWidths)
+          : InkRenderer.ribbonPath(
+            centerline: screenPoints,
+            halfWidths: halfWidths,
+            flatNib: profile.flatNib,
+            allowShortAxis: axisFactors != nil
+          )
       {
         layer.fill(ribbon, with: .color(markColor))
         return true
@@ -327,7 +351,7 @@ public enum RemoteDrawStrokePainter {
       // Uniform instruments, and the fallback when a ribbon degenerates.
       guard screenPoints.count >= 2 else { return false }
       layer.stroke(
-        InkRenderer.smoothPath(through: screenPoints),
+        centerline,
         with: .color(markColor),
         style: StrokeStyle(
           lineWidth: lineWidth,
@@ -458,18 +482,21 @@ public enum RemoteDrawStrokePainter {
     profile: RemoteDrawInk.Profile,
     axisFactors: [Double]?,
     lineWidth: CGFloat,
-    surfaceExtent: CGFloat
+    surfaceExtent: CGFloat,
+    dynamicsScale: CGSize = CGSize(width: 1, height: 1)
   ) -> [CGFloat]? {
     let factors: [Double]
     if let axisFactors {
       factors = axisFactors
     } else if let band = profile.band {
-      factors = InkRenderer.widthFactors(for: points, range: band)
+      factors = InkRenderer.widthFactors(for: points, range: band, coordinateScale: dynamicsScale)
     } else {
       return nil
     }
     guard factors.count == screenPoints.count else { return nil }
-    let tapers = profile.taper.map {
+    // A closed outline has no ends to taper; see `InkRenderer.isClosedOutline`.
+    let closed = InkRenderer.isClosedOutline(screenPoints, extent: surfaceExtent)
+    let tapers = (closed ? nil : profile.taper).map {
       // The stroke width goes with it: each end's length is capped in nib
       // widths, which is what keeps an instrument the same shape at every
       // width. Mirrors `perPointStrokeWidths` on the web.
@@ -497,7 +524,8 @@ public enum RemoteDrawStrokePainter {
     opacity: Double,
     lineWidth: CGFloat,
     defaults: Defaults,
-    surface: RemoteDrawInkSurface.Kind = RemoteDrawInkSurface.defaultKind
+    surface: RemoteDrawInkSurface.Kind = RemoteDrawInkSurface.defaultKind,
+    dynamicsScale: CGSize = CGSize(width: 1, height: 1)
   ) -> Bool {
     if stroke.type == "rectangle" || stroke.type == "ellipse",
       let fillColor = resolvedFillColor(for: stroke.style, kind: kind, defaults: defaults),
@@ -505,45 +533,71 @@ public enum RemoteDrawStrokePainter {
     {
       let screenPoints = outline.map { scaled($0, in: size) }
       if screenPoints.count >= 3 {
-        var loop = Path()
-        loop.move(to: screenPoints[0])
-        for point in screenPoints.dropFirst() { loop.addLine(to: point) }
-        loop.closeSubpath()
-        context.fill(loop, with: .color(fillColor))
+        context.fill(
+          washPath(screenPoints, extent: max(size.width, size.height)), with: .color(fillColor))
       }
     }
 
-    var painted = false
     let isFlatNib = kind == .highlighter || kind == .chalk
-    for outline in outlines {
-      let screenPoints = outline.map { scaled($0, in: size) }
-      guard screenPoints.count >= 2 else { continue }
-      if drawFreehandMark(
-        points: outline,
-        screenPoints: screenPoints,
-        kind: kind,
-        baseColor: baseColor,
-        strokeOpacity: opacity,
-        lineWidth: lineWidth,
-        size: size,
-        in: &context,
-        surface: surface
-      ) {
-        painted = true
-        continue
-      }
-      context.stroke(
-        InkRenderer.smoothPath(through: screenPoints),
-        with: .color(color),
-        style: StrokeStyle(
+    func paintOutlines(_ target: inout GraphicsContext, strokeOpacity: Double, color: Color) -> Bool {
+      var painted = false
+      for outline in outlines {
+        let screenPoints = outline.map { scaled($0, in: size) }
+        guard screenPoints.count >= 2 else { continue }
+        if drawFreehandMark(
+          points: outline,
+          screenPoints: screenPoints,
+          kind: kind,
+          baseColor: baseColor,
+          strokeOpacity: strokeOpacity,
           lineWidth: lineWidth,
-          lineCap: isFlatNib ? .butt : .round,
-          lineJoin: .round
+          size: size,
+          in: &target,
+          surface: surface,
+          dynamicsScale: dynamicsScale
+        ) {
+          painted = true
+          continue
+        }
+        target.stroke(
+          InkRenderer.smoothPath(through: screenPoints),
+          with: .color(color),
+          style: StrokeStyle(
+            lineWidth: lineWidth,
+            lineCap: isFlatNib ? .butt : .round,
+            lineJoin: .round
+          )
         )
-      )
-      painted = true
+        painted = true
+      }
+      return painted
     }
-    return painted
+
+    // An arrow is two outlines — shaft, then head — but one mark. Painted one
+    // after the other, a translucent instrument laid its alpha twice where the
+    // head overlaps the shaft (a dark knot at a highlighter arrow's tip), so the
+    // outlines paint at full strength into one layer that carries the alpha.
+    // Only where that cannot change anything else: a flattened instrument
+    // already paints into its own layer, and a single-path one bakes the alpha
+    // into its one fill. Mirrors `freehandMarkGroupPaths` on the web.
+    let profile = RemoteDrawInk.profile(for: kind, surface: surface)
+    let singlePath =
+      profile.grain == nil && profile.scatter == nil && profile.glow == nil
+      && profile.tooth == nil
+    if outlines.count > 1, opacity < 1, profile.multiply || profile.flatten || singlePath {
+      // The alpha goes on the context the layer is composited *from*; set
+      // inside the layer it would apply to each outline drawn there, which is
+      // the doubling this exists to remove.
+      var painted = false
+      var group = context
+      group.opacity *= opacity
+      group.drawLayer { layer in
+        layer.opacity = 1
+        painted = paintOutlines(&layer, strokeOpacity: 1, color: baseColor)
+      }
+      return painted
+    }
+    return paintOutlines(&context, strokeOpacity: opacity, color: color)
   }
 
   private static func fill(
@@ -551,6 +605,7 @@ public enum RemoteDrawStrokePainter {
     screenPoints: [CGPoint],
     isFreehand: Bool,
     fillColor: Color,
+    surfaceExtent: CGFloat,
     in context: inout GraphicsContext
   ) {
     if type == "rectangle" || type == "ellipse" {
@@ -572,10 +627,21 @@ public enum RemoteDrawStrokePainter {
         context.fill(loop, with: .color(fillColor))
       }
     } else if isFreehand, isClosedLoop(screenPoints) {
-      var loop = InkRenderer.smoothPath(through: screenPoints)
-      loop.closeSubpath()
-      context.fill(loop, with: .color(fillColor))
+      context.fill(washPath(screenPoints, extent: surfaceExtent), with: .color(fillColor))
     }
+  }
+
+  /// The wash under a closed stroke. A shape's closed outline gets the same
+  /// wrapped curve its ribbon is built on, so the wash meets the centerline all
+  /// the way round, seam included; a hand-closed loop gets its open curve,
+  /// closed straight across the gap. Mirrors `closedLoopFillPath` on the web.
+  private static func washPath(_ screenPoints: [CGPoint], extent: CGFloat) -> Path {
+    if InkRenderer.isClosedOutline(screenPoints, extent: extent) {
+      return InkRenderer.closedSmoothPath(through: Array(screenPoints.dropLast()))
+    }
+    var loop = InkRenderer.smoothPath(through: screenPoints)
+    loop.closeSubpath()
+    return loop
   }
 
   private static func drawArrow(

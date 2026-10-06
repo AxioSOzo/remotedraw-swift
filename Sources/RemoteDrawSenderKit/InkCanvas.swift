@@ -69,7 +69,7 @@ public struct RemoteDrawInkCanvas: View {
   private var marks: [RemoteDrawBoardMark] {
     var marks = strokes.map {
       RemoteDrawBoardMark(
-        id: $0.id, type: $0.type, points: $0.points, text: $0.text, style: $0.style,
+        id: $0.id, type: $0.type, points: $0.type == "image" ? RemoteDrawImageGeometry.corners($0.points) : $0.points, text: $0.text, imageUrl: $0.imageUrl, style: $0.style,
         lineWidth: defaults.lineWidth)
     }
     if let live {

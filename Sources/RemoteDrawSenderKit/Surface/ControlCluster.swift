@@ -126,7 +126,9 @@ public struct RemoteDrawTextComposerConfiguration {
   }
 }
 
-private struct RemoteDrawTextComposer: View {
+/// Internal rather than private so ``RemoteDrawControlBar`` can present the
+/// same composer: one text field for both chromes, not two that drift.
+struct RemoteDrawTextComposer: View {
   let configuration: RemoteDrawTextComposerConfiguration
 
   @Environment(\.remoteDrawAppearance) private var appearance

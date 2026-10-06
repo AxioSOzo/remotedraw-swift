@@ -101,6 +101,29 @@ final class RecoveryContractTests: XCTestCase {
     XCTAssertEqual(attempts, 2)
   }
 
+  func testRateLimitWaitHonorsRetryAfterAndPositiveJitter() async throws {
+    let waits = RetryWaitRecorder()
+    var attempts = 0
+    _ = try await retryIdempotentRequest(jitter: { 0.5 }, sleep: { await waits.record($0) }) { () -> Int in
+      attempts += 1
+      if attempts == 1 { throw RemoteDrawError.rateLimited(retryAfter: 7, bucket: "sender") }
+      return 1
+    }
+    let recorded = await waits.values
+    XCTAssertEqual(recorded, [7.125])
+  }
+
+  func testAuthFailureRateLimitDoesNotBlindlyRetry() async {
+    var attempts = 0
+    do {
+      _ = try await retryIdempotentRequest(sleep: { _ in XCTFail("Must not wait") }) { () -> Int in
+        attempts += 1
+        throw RemoteDrawError.rateLimited(retryAfter: 60, bucket: "auth_failures_per_ip")
+      }
+    } catch {}
+    XCTAssertEqual(attempts, 1)
+  }
+
   // MARK: - Messages
 
   func testEveryErrorNamesTheActionThatFixesIt() {
@@ -131,4 +154,9 @@ final class RecoveryContractTests: XCTestCase {
     XCTAssertTrue(text.contains("/v1/sessions/direct-sender"))
     XCTAssertTrue(text.lowercased().contains("do not call that endpoint from the app"))
   }
+}
+
+private actor RetryWaitRecorder {
+  var values: [TimeInterval] = []
+  func record(_ wait: TimeInterval) { values.append(wait) }
 }

@@ -326,6 +326,13 @@ enum RemoteDrawInk {
   struct Capacity: Equatable {
     let floor: Double
     let gain: Double
+    let texture: Int
+
+    init(floor: Double, gain: Double, texture: Int = 0) {
+      self.floor = floor
+      self.gain = gain
+      self.texture = texture
+    }
   }
 
   /// Everything a *run* of marks composites as one film: its ceiling, and how
@@ -380,11 +387,11 @@ enum RemoteDrawInk {
   /// Bound onto the profile only when the surface supplies a tooth.
   static func capacity(for kind: DrawingStyleKind?) -> Capacity? {
     switch kind {
-    case .pencil: return Capacity(floor: 0.208, gain: 0.621)
-    case .tiltPencil: return Capacity(floor: 0.136, gain: 0.612)
-    case .chalk: return Capacity(floor: 0.315, gain: 0.519)
-    case .charcoal: return Capacity(floor: 0.391, gain: 0.442)
-    case .crayon: return Capacity(floor: 0.344, gain: 0.468)
+    case .pencil: return Capacity(floor: 0.208, gain: 0.621, texture: 1)
+    case .tiltPencil: return Capacity(floor: 0.136, gain: 0.612, texture: 1)
+    case .chalk: return Capacity(floor: 0.315, gain: 0.519, texture: 2)
+    case .charcoal: return Capacity(floor: 0.391, gain: 0.442, texture: 3)
+    case .crayon: return Capacity(floor: 0.344, gain: 0.468, texture: 4)
     case .dryBrush: return Capacity(floor: 0.247, gain: 0.544)
     default: return nil
     }
@@ -453,9 +460,43 @@ enum RemoteDrawInk {
   /// "free", and at a phone's extent it is still hundreds of milliseconds.
   private static let toothLock = NSLock()
   private static var toothImages: [String: CGImage] = [:]
-  /// Keys whose rasterisation is in flight — or has permanently failed, which
-  /// is the same thing as far as "do not start another one" is concerned.
-  private static var toothBuildsStarted: Set<String> = []
+  /// Shared budget includes completed failures and pending work, so a pinch
+  /// cannot retain one bitmap or queued raster task for every intermediate size.
+  struct ToothCacheBudget {
+    static let maximumEntries = 12
+    static let maximumPending = 4
+    private(set) var completed: [String] = []
+    private(set) var pending: Set<String> = []
+
+    mutating func begin(_ key: String) -> Bool {
+      guard !completed.contains(key), !pending.contains(key),
+        pending.count < Self.maximumPending else { return false }
+      pending.insert(key)
+      return true
+    }
+
+    mutating func finish(_ key: String) -> String? {
+      pending.remove(key)
+      completed.append(key)
+      return completed.count > Self.maximumEntries ? completed.removeFirst() : nil
+    }
+  }
+  private static var toothBudget = ToothCacheBudget()
+
+  struct ToothRasterPlan: Equatable {
+    static let maximumSide = 1024
+    let logicalExtent: CGFloat
+    let side: Int
+    var unitsPerPixel: Double { Double(logicalExtent) / Double(side) }
+
+    init?(extent: CGFloat) {
+      // Also protects the paper-noise lattice's Double-to-Int conversion.
+      // Declining a pathological mask never changes the scene's geometry.
+      guard extent.isFinite, extent > 0, extent <= 10_000_000 else { return nil }
+      logicalExtent = max(1, extent.rounded())
+      side = Int(min(CGFloat(Self.maximumSide), logicalExtent))
+    }
+  }
   private static let toothQueue = DispatchQueue(
     label: "com.remotedraw.ios.tooth-field", qos: .userInitiated)
 
@@ -467,15 +508,29 @@ enum RemoteDrawInk {
   /// rasterises on the calling thread — callers paint unmasked until it lands.
   /// Nil forever on a surface with no tooth.
   static func toothImage(for surface: RemoteDrawInkSurface.Kind, extent: CGFloat) -> CGImage? {
-    guard RemoteDrawInkSurface.tooth(surface) != nil else { return nil }
-    let key = toothKey(surface, extent)
+    fieldImage(for: surface, extent: extent, texture: 0)
+  }
+
+  /// Optical retained-pigment field. A material capacity never replaces the
+  /// substrate image used for per-stroke contact or the visible paper ground.
+  static func capacityImage(
+    for surface: RemoteDrawInkSurface.Kind, extent: CGFloat, texture: Int
+  ) -> CGImage? {
+    fieldImage(for: surface, extent: extent, texture: (1...4).contains(texture) ? texture : 0)
+  }
+
+  private static func fieldImage(
+    for surface: RemoteDrawInkSurface.Kind, extent: CGFloat, texture: Int
+  ) -> CGImage? {
+    guard RemoteDrawInkSurface.tooth(surface) != nil, let plan = ToothRasterPlan(extent: extent) else { return nil }
+    let key = toothKey(surface, plan.logicalExtent) + (texture == 0 ? "" : "-material-\(texture)")
     toothLock.lock()
     let cached = toothImages[key]
-    let alreadyStarted = cached != nil || !toothBuildsStarted.insert(key).inserted
+    let shouldStart = cached == nil && toothBudget.begin(key)
     toothLock.unlock()
     if let cached { return cached }
-    guard !alreadyStarted else { return nil }
-    toothQueue.async { buildToothImage(for: surface, extent: extent, key: key) }
+    guard shouldStart else { return nil }
+    toothQueue.async { buildToothImage(for: surface, extent: plan.logicalExtent, key: key, texture: texture) }
     return nil
   }
 
@@ -486,21 +541,20 @@ enum RemoteDrawInk {
   }
 
   private static func buildToothImage(
-    for surface: RemoteDrawInkSurface.Kind, extent: CGFloat, key: String
+    for surface: RemoteDrawInkSurface.Kind, extent: CGFloat, key: String, texture: Int = 0
   ) {
     RDTrace.mark(
       RDLog.render,
       "tooth field build started key=\(key) extent=\(Int(extent.rounded()))")
     let (image, milliseconds) = RDTrace.measure {
-      rasterizeToothImage(for: surface, extent: extent)
+      rasterizeToothImage(for: surface, extent: extent, texture: texture)
     }
-    if let image {
-      toothLock.lock()
-      toothImages[key] = image
-      toothLock.unlock()
-    }
-    // A failed build keeps its key in `toothBuildsStarted`: the failure is a
-    // context allocation, which retrying every frame would not fix.
+    toothLock.lock()
+    if let image { toothImages[key] = image }
+    if let evicted = toothBudget.finish(key) { toothImages.removeValue(forKey: evicted) }
+    toothLock.unlock()
+    // Failed allocations occupy a bounded completion entry too, avoiding
+    // frame-by-frame retries while keeping failure bookkeeping bounded.
     RDTrace.mark(
       RDLog.render,
       String(
@@ -552,11 +606,12 @@ enum RemoteDrawInk {
   /// `Tooth.scale` and `Tooth.radius` describe the web's dead cell lattice and
   /// are not read here.
   private static func rasterizeToothImage(
-    for surface: RemoteDrawInkSurface.Kind, extent: CGFloat
+    for surface: RemoteDrawInkSurface.Kind, extent: CGFloat, texture: Int = 0
   ) -> CGImage? {
     let spec = RemoteDrawInkSurface.spec(surface)
     guard let grain = spec.grain, spec.tooth != nil else { return nil }
-    let side = Int(max(1, extent.rounded()))
+    guard let plan = ToothRasterPlan(extent: extent) else { return nil }
+    let side = plan.side
     // Context-owned storage rather than a Swift array: `makeImage` is free to
     // share a bitmap context's buffer copy-on-write, and a buffer that dies
     // with the local array is not one to hand it.
@@ -572,8 +627,9 @@ enum RemoteDrawInk {
       for x in 0..<side {
         // Pixel centres, so the mask samples the field where the ground tile
         // does — a mark's valleys and the sheet's are the same valleys.
-        let height = RemoteDrawPaperGround.height(
-          Double(x) + 0.5, Double(y) + 0.5, grain: grain)
+        let height = RemoteDrawPaperGround.materialCapacityHeight(
+          (Double(x) + 0.5) * plan.unitsPerPixel,
+          (Double(y) + 0.5) * plan.unitsPerPixel, grain: grain, texture: texture)
         // Opaque is a ridge, transparent is a valley floor. How much of that
         // range a given consumer actually uses is the consumer's ramp: the
         // stroke mask spans `Tooth.depth` of it, the group's ceiling spans
@@ -694,9 +750,10 @@ enum RemoteDrawInk {
         band: 0.58...1.14, taper: InkRenderer.inkTaper, widthScale: 0.78)
     case .brushPen:
       return Profile(
-        band: 0.34...1.44, taper: InkRenderer.brushTaper, widthScale: 1.18)
+        band: 0.34...1.44, taper: InkRenderer.brushTaper, widthScale: 1.18,
+        wetness: 0.4)
     case .fineliner:
-      return Profile(band: nil, taper: nil, widthScale: 0.62)
+      return Profile(band: nil, taper: nil, widthScale: 0.62, wetness: 0.12)
     case .ballpoint:
       // An oil-based paste, not a solvent ink: a biro on blotting paper still
       // draws a hard line, which is most of why it is the pen that survives
@@ -732,7 +789,7 @@ enum RemoteDrawInk {
         toneScale: 1.0942)
     case .italicNib:
       return Profile(
-        band: nil, taper: nil, nib: Nib(angleDegrees: 42, thin: 0.12))
+        band: nil, taper: nil, flatNib: true, nib: Nib(angleDegrees: 42, thin: 0.12))
     case .chiselMarker:
       return Profile(
         band: nil, taper: nil, widthScale: 1.3, flatNib: true,
@@ -1062,6 +1119,29 @@ public enum RemoteDrawInkSurface {
 /// had, which is why the phone's marks read as static and then, once the mask
 /// stopped biting at all, as marker.
 enum RemoteDrawPaperGround {
+  /// Mirrors materialCapacityHeight in client/dabEngine.ts. Optical deposit
+  /// structure, not a change to physical paper height or contact sampling.
+  static func materialCapacityHeight(
+    _ pageX: Double, _ pageY: Double, grain: Double?, texture: Int = 0
+  ) -> Double {
+    guard let grain, grain > 0 else { return 1 }
+    guard pageX.isFinite, pageY.isFinite else { return 0.5 }
+    guard (1...4).contains(texture) else { return height(pageX, pageY, grain: grain) }
+    let x = (pageX.truncatingRemainder(dividingBy: 512) + 512).truncatingRemainder(dividingBy: 512)
+    let y = (pageY.truncatingRemainder(dividingBy: 512) + 512).truncatingRemainder(dividingBy: 512)
+    let h = height(x, y, grain: grain)
+    let fine = valueNoise((x * 0.91 - y * 0.41) / 2.6 + 37, (x * 0.41 + y * 0.91) / 2.6 - 19)
+    let clump = valueNoise(x / 6.4 - 13, y / 6.4 + 29)
+    switch texture {
+    case 1: return min(1, max(0, 0.5 + (h - 0.5) * 0.28 + (fine - 0.5) * 0.8))
+    case 2: return min(1, max(0, 0.5 + (h - 0.5) * 0.24 + (fine - 0.5) * 0.9 + (clump - 0.5) * 0.22))
+    case 3: return min(1, max(0, 0.5 + (h - 0.5) * 0.22 + (fine - 0.5) * 0.5 + (clump - 0.5) * 1.15))
+    default:
+      let waxGap = min(1, max(0, (fine - 0.58) / 0.32))
+      return min(1, max(0, 0.68 + (h - 0.5) * 0.12 + (clump - 0.5) * 0.3 - 0.42 * waxGap * waxGap * (3 - 2 * waxGap)))
+    }
+  }
+
   /// Cartridge paper's base tone. Mirrors `PAPER_GROUND.base`.
   static let base: (red: Double, green: Double, blue: Double) = (247, 244, 237)
 
@@ -1683,7 +1763,8 @@ enum InkRenderer {
   /// when neither exists. Factors are neighbor-averaged so a single noisy
   /// sample never produces a bulge. Pass `range` (e.g. `markerFactorRange`)
   /// to override the per-mode clamps with a narrower dynamics band.
-  static func widthFactors(for points: [NormalizedPoint], range: ClosedRange<Double>? = nil) -> [Double] {
+  static func widthFactors(for points: [NormalizedPoint], range: ClosedRange<Double>? = nil,
+    coordinateScale: CGSize = CGSize(width: 1, height: 1)) -> [Double] {
     guard !points.isEmpty else { return [] }
     let pressureRange = range ?? pressureFactorRange
     let velocityRange = range ?? velocityFactorRange
@@ -1704,7 +1785,8 @@ enum InkRenderer {
         let current = points[index]
         guard let previousT = previous.t, let currentT = current.t else { continue }
         let dt = max(1, currentT - previousT)
-        let velocity = hypot(current.x - previous.x, current.y - previous.y) / dt
+        let velocity = hypot((current.x - previous.x) * coordinateScale.width,
+          (current.y - previous.y) * coordinateScale.height) / dt
         let smoothedVelocity = ema.map { velocityEmaAlpha * velocity + (1 - velocityEmaAlpha) * $0 } ?? velocity
         ema = smoothedVelocity
         factors[index] = clamped(1.2 - smoothedVelocity / velocityReference, to: velocityRange)
@@ -1783,12 +1865,171 @@ enum InkRenderer {
     }
   }
 
+  /// Below this many nib widths of centerline, a pressure/velocity stroke is
+  /// painted as a capsule — the stroked centerline at the nominal nib with the
+  /// instrument's cap — rather than a ribbon. Mirrors `SHORT_STROKE_NIB_WIDTHS`
+  /// in packages/client/src/inkGeometry.ts; `tests/api/inkSwiftParity.test.ts`
+  /// pins the two numbers together.
+  static let shortStrokeNibWidths: CGFloat = 2.5
+
+  /// Whether a stroke is too short for a ribbon: a dash or a jab under
+  /// `shortStrokeNibWidths` nib widths. As a ribbon it had nowhere to vary —
+  /// both tapers and the landing's velocity bulge crowd into a few samples, and
+  /// a 3 mm dash drew a lumpy hexagon with a round "ear" where the entry cap
+  /// sat. Mirrors `isShortStroke` on the web.
+  static func isShortStroke(_ points: [CGPoint], lineWidth: CGFloat) -> Bool {
+    let limit = lineWidth * shortStrokeNibWidths
+    var length: CGFloat = 0
+    for index in points.indices.dropFirst() {
+      length += hypot(points[index].x - points[index - 1].x, points[index].y - points[index - 1].y)
+      if length >= limit { return false }
+    }
+    return true
+  }
+
+  /// Two samples closer than this fraction of the surface are one position.
+  /// Mirrors `CLOSED_OUTLINE_TOLERANCE` in packages/client/src/inkGeometry.ts.
+  static let closedOutlineTolerance: CGFloat = 0.00001
+
+  /// How round a ring must be — `4π·area / perimeter²`, 1 for a circle — to be
+  /// painted as a closed outline. Any shape encloses far more (a 1:20 ellipse
+  /// is 0.12); a stroke that went out and came back along itself encloses next
+  /// to nothing. Mirrors `CLOSED_OUTLINE_MIN_ROUNDNESS`.
+  static let closedOutlineMinRoundness: CGFloat = 0.02
+
+  /// Whether a path is a closed outline: at least four samples, the last one
+  /// landing on the first, and a ring that encloses something. Shapes are why:
+  /// `shapeInkStrokes` walks a rectangle or an ellipse back to its first
+  /// sample, and shape assist's fitted polygons and rotated shapes (stored as
+  /// freehand, nothing marking them fitted) end on the very seam they started
+  /// from. A hand can close exactly too — stored points are quantized to
+  /// 1/65535 of the board and touches arrive on whole pixels — and is then
+  /// painted as the ring it is. The roundness floor keeps a stroke that doubles
+  /// back onto its start open. A closed outline has no pen-down or pen-up, so
+  /// it is painted with no taper, no caps and a tangent that wraps across the
+  /// seam. Mirrors `isClosedInkOutline`, whose note has the whole argument.
+  static func isClosedOutline(_ points: [CGPoint], extent: CGFloat) -> Bool {
+    guard points.count >= 4, let first = points.first, let last = points.last,
+      hypot(last.x - first.x, last.y - first.y) < extent * closedOutlineTolerance
+    else { return false }
+    var twiceArea: CGFloat = 0
+    var perimeter: CGFloat = 0
+    for index in 1..<points.count {
+      let a = points[index - 1]
+      let b = points[index]
+      twiceArea += a.x * b.y - b.x * a.y
+      perimeter += hypot(b.x - a.x, b.y - a.y)
+    }
+    return perimeter > 0
+      && 2 * .pi * abs(twiceArea) / (perimeter * perimeter) >= closedOutlineMinRoundness
+  }
+
+  /// A closed Catmull-Rom curve through a ring (first sample not repeated):
+  /// every tangent, the seam's included, comes from neighbours on both sides.
+  /// Mirrors `closedSmoothPath` on the web.
+  static func closedSmoothPath(through ring: [CGPoint]) -> Path {
+    var path = Path()
+    guard ring.count > 2 else {
+      path.addLines(ring)
+      path.closeSubpath()
+      return path
+    }
+    addClosedSmoothCurves(&path, through: ring)
+    return path
+  }
+
+  private static func addClosedSmoothCurves(_ path: inout Path, through ring: [CGPoint]) {
+    let count = ring.count
+    let wrapped = [ring[count - 1]] + ring + [ring[0], ring[1 % count]]
+    path.move(to: ring[0])
+    for index in 1...count {
+      let p0 = wrapped[index - 1]
+      let p1 = wrapped[index]
+      let p2 = wrapped[index + 1]
+      let p3 = wrapped[index + 2]
+      let startFactor = catmullRomTurnFactor(p0, p1, p2)
+      let endFactor = catmullRomTurnFactor(p1, p2, p3)
+      let limit = hypot(p2.x - p1.x, p2.y - p1.y) / 3
+      func handle(_ x: CGFloat, _ y: CGFloat, _ factor: CGFloat) -> CGPoint {
+        var hx = x / 6 * factor
+        var hy = y / 6 * factor
+        let length = hypot(hx, hy)
+        if length > limit {
+          let scale = limit / length
+          hx *= scale
+          hy *= scale
+        }
+        return CGPoint(x: hx, y: hy)
+      }
+      let start = handle(p2.x - p0.x, p2.y - p0.y, startFactor)
+      let end = handle(p3.x - p1.x, p3.y - p1.y, endFactor)
+      path.addCurve(
+        to: p2,
+        control1: CGPoint(x: p1.x + start.x, y: p1.y + start.y),
+        control2: CGPoint(x: p2.x - end.x, y: p2.y - end.y))
+    }
+    path.closeSubpath()
+  }
+
+  /// Unit normals around a ring (first sample not repeated), each from its
+  /// neighbours on both sides — the seam's included, so nothing offset along
+  /// them steps where the loop closes. Nil when two neighbours coincide.
+  /// Mirrors `ringNormals` on the web.
+  static func ringNormals(_ ring: [CGPoint]) -> [CGVector]? {
+    let count = ring.count
+    guard count > 0 else { return nil }
+    var normals = [CGVector]()
+    normals.reserveCapacity(count)
+    for index in 0..<count {
+      let previous = ring[(index - 1 + count) % count]
+      let next = ring[(index + 1) % count]
+      let dx = next.x - previous.x
+      let dy = next.y - previous.y
+      let length = hypot(dx, dy)
+      guard length > 0 else { return nil }
+      normals.append(CGVector(dx: -dy / length, dy: dx / length))
+    }
+    return normals
+  }
+
+  /// The ribbon of a closed outline: both edges closed, wound in opposite
+  /// directions so the nonzero fill paints the band between them. No taper and
+  /// no caps. `centerline` repeats its first sample at the end, as the outline
+  /// arrives; the seam's half-width is the mean of the two ends'. Mirrors
+  /// `closedRibbonPlan` on the web.
+  static func closedRibbonPath(centerline points: [CGPoint], halfWidths: [CGFloat]) -> Path? {
+    guard points.count >= 4, points.count == halfWidths.count else { return nil }
+    let ring = Array(points.dropLast())
+    let count = ring.count
+    var widths = Array(halfWidths.dropLast())
+    widths[0] = (halfWidths[0] + halfWidths[count]) / 2
+    guard let normals = ringNormals(ring) else { return nil }
+    var left = [CGPoint]()
+    var right = [CGPoint]()
+    for index in 0..<count {
+      let normal = normals[index]
+      let halfWidth = max(minimumHalfWidth, widths[index])
+      let point = ring[index]
+      left.append(CGPoint(x: point.x + normal.dx * halfWidth, y: point.y + normal.dy * halfWidth))
+      right.append(CGPoint(x: point.x - normal.dx * halfWidth, y: point.y - normal.dy * halfWidth))
+    }
+    guard left.allSatisfy(isFinite), right.allSatisfy(isFinite) else { return nil }
+    var path = Path()
+    addClosedSmoothCurves(&path, through: left)
+    addClosedSmoothCurves(&path, through: right.reversed())
+    return path
+  }
+
   /// Variable-width ribbon: the smoothed centerline offset along its normals
-  /// by per-point half-widths, closed with round end caps, meant to be filled.
+  /// by per-point half-widths, closed with the instrument's end caps and filled.
   /// Returns nil for degenerate input so callers can fall back to a stroked
   /// path.
-  static func ribbonPath(centerline points: [CGPoint], halfWidths: [CGFloat]) -> Path? {
-    guard points.count >= 3, points.count == halfWidths.count else { return nil }
+  static func ribbonPath(
+    centerline points: [CGPoint], halfWidths: [CGFloat],
+    flatNib: Bool = false, allowShortAxis: Bool = false
+  ) -> Path? {
+    // A broad nib has its directional width as soon as two points exist.
+    guard points.count >= (allowShortAxis ? 2 : 3), points.count == halfWidths.count else { return nil }
     guard let normals = centerlineNormals(points) else { return nil }
 
     var left = [CGPoint]()
@@ -1808,19 +2049,27 @@ enum InkRenderer {
     var path = Path()
     path.move(to: left[0])
     addSmoothCurves(&path, through: left)
-    addCap(
-      &path,
-      center: points[last],
-      radius: max(minimumHalfWidth, halfWidths[last]),
-      startAngle: atan2(left[last].y - points[last].y, left[last].x - points[last].x)
-    )
+    if flatNib {
+      path.addLine(to: right[last])
+    } else {
+      addCap(
+        &path,
+        center: points[last],
+        radius: max(minimumHalfWidth, halfWidths[last]),
+        startAngle: atan2(left[last].y - points[last].y, left[last].x - points[last].x)
+      )
+    }
     addSmoothCurves(&path, through: Array(right.reversed()))
-    addCap(
-      &path,
-      center: points[0],
-      radius: max(minimumHalfWidth, halfWidths[0]),
-      startAngle: atan2(right[0].y - points[0].y, right[0].x - points[0].x)
-    )
+    if flatNib {
+      path.addLine(to: left[0])
+    } else {
+      addCap(
+        &path,
+        center: points[0],
+        radius: max(minimumHalfWidth, halfWidths[0]),
+        startAngle: atan2(right[0].y - points[0].y, right[0].x - points[0].x)
+      )
+    }
     path.closeSubpath()
     return path
   }
@@ -1913,22 +2162,39 @@ enum InkRenderer {
   /// `widths` is per-point so grain tracks a ribbon that is itself varying —
   /// what a dry brush or a tilted pencil needs. Returns nil for degenerate
   /// input so callers fall back to a plain stroked path.
+  ///
+  /// `closed` is a shape's closed outline (`isClosedOutline`; `centerline`
+  /// repeats its first sample at the end): the body and every streak run round
+  /// the ring and close, on normals that wrap across the seam, whose width is
+  /// the mean of the two ends'. Built open, each pass ended in a butt cap at
+  /// the seam and left a notch in the corner. Mirrors `freehandGrainLayers`.
   static func grainStreaks(
     centerline points: [CGPoint],
     widths: [CGFloat],
-    grain: RemoteDrawInk.Grain
+    grain: RemoteDrawInk.Grain,
+    closed: Bool = false
   ) -> [GrainStreak]? {
     guard points.count >= 2, !widths.isEmpty else { return nil }
-    guard let normals = centerlineNormals(points) else { return nil }
+    let ring = closed && points.count >= 4 ? Array(points.dropLast()) : nil
+    let normals: [CGVector]?
+    if let ring { normals = ringNormals(ring) } else { normals = centerlineNormals(points) }
+    guard let normals else { return nil }
+    let centerline = ring ?? points
+    let path: ([CGPoint]) -> Path = { samples in
+      ring == nil ? smoothPath(through: samples) : closedSmoothPath(through: samples)
+    }
     let nominal = widths.reduce(0, +) / CGFloat(widths.count)
     guard nominal > 0 else { return nil }
     let widthAt: (Int) -> CGFloat = { index in
-      widths[min(max(0, index), widths.count - 1)]
+      if ring != nil, index == 0 {
+        return (widths[0] + widths[min(points.count - 1, widths.count - 1)]) / 2
+      }
+      return widths[min(max(0, index), widths.count - 1)]
     }
 
     var streaks: [GrainStreak] = [
       GrainStreak(
-        path: smoothPath(through: points),
+        path: path(centerline),
         width: nominal * CGFloat(grain.bodyWidth),
         alpha: grain.bodyAlpha,
         dash: []
@@ -1952,7 +2218,7 @@ enum InkRenderer {
           nominal * CGFloat(mix(off, noise(streak, 6))),
         ]
       }
-      let shifted = points.enumerated().map { index, point -> CGPoint in
+      let shifted = centerline.enumerated().map { index, point -> CGPoint in
         let normal = normals[index]
         let local = widthAt(index)
         let offset = CGFloat((seat - 0.5) * grain.spread) * local
@@ -1965,7 +2231,7 @@ enum InkRenderer {
       }
       streaks.append(
         GrainStreak(
-          path: smoothPath(through: shifted),
+          path: path(shifted),
           width: streakWidth,
           alpha: alpha,
           dash: dash

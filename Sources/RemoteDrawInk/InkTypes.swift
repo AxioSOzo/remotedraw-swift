@@ -89,19 +89,30 @@ public struct RemoteDrawDrawingStyle: Codable, Equatable, Sendable {
   public let width: Double?
   public let opacity: Double?
   public let fill: RemoteDrawDrawingFill?
+  /// Protocol metadata is retained for editing/round trips. The native ink
+  /// renderer does not yet implement physical 2.5D shading.
+  public let textureMode: String?
+  public let textureMaterial: String?
+  public let textureSurface: String?
 
   public init(
     kind: String? = nil,
     color: String? = nil,
     width: Double? = nil,
     opacity: Double? = nil,
-    fill: RemoteDrawDrawingFill? = nil
+    fill: RemoteDrawDrawingFill? = nil,
+    textureMode: String? = nil,
+    textureMaterial: String? = nil,
+    textureSurface: String? = nil
   ) {
     self.kind = kind
     self.color = color
     self.width = width
     self.opacity = opacity
     self.fill = fill
+    self.textureMode = textureMode
+    self.textureMaterial = textureMaterial
+    self.textureSurface = textureSurface
   }
 
   public init(
@@ -109,10 +120,14 @@ public struct RemoteDrawDrawingStyle: Codable, Equatable, Sendable {
     color: String? = nil,
     width: Double? = nil,
     opacity: Double? = nil,
-    fill: RemoteDrawDrawingFill? = nil
+    fill: RemoteDrawDrawingFill? = nil,
+    textureMode: String? = nil,
+    textureMaterial: String? = nil,
+    textureSurface: String? = nil
   ) {
     self.init(
-      kind: kind.rawValue, color: color, width: width, opacity: opacity, fill: fill)
+      kind: kind.rawValue, color: color, width: width, opacity: opacity, fill: fill,
+      textureMode: textureMode, textureMaterial: textureMaterial, textureSurface: textureSurface)
   }
 }
 

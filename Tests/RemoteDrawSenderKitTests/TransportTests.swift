@@ -145,6 +145,16 @@ final class TransportTests: XCTestCase {
       "https://api.example.test/v1/sender/projection/close")
   }
 
+  func testDrawingsAsksForPackedPoints() async throws {
+    StubURLProtocol.reset(.init(status: 200, body: #"{"items":[]}"#))
+    let transport = makeTransport()
+    _ = try await transport.drawings(senderToken: "rd_send_1")
+    XCTAssertEqual(StubURLProtocol.lastRequest?.0.url?.path, "/v1/sender/drawings")
+    let body = try StubURLProtocol.lastBody()
+    XCTAssertEqual(body["senderToken"] as? String, "rd_send_1")
+    XCTAssertEqual(body["encoding"] as? String, "packed")
+  }
+
   func testEveryRequestIdentifiesTheSDK() async throws {
     // Without this, "old SDK meets new API" is a silently degraded drawing —
     // the failure mode neither end can detect.
@@ -210,6 +220,45 @@ final class TransportTests: XCTestCase {
     // The sequence survives rotation, so a resuming sender continues where it
     // left off rather than restarting at 0 and having every draft rejected.
     XCTAssertEqual(rotated.lastSequence, 9)
+  }
+
+  func testSyncPostsTheCredentialToItsOwnRouteAndDecodesTheRevisionShape() async throws {
+    // The shape `convex/lib/syncRevisions.ts` answers: four opaque strings.
+    StubURLProtocol.reset(
+      .init(status: 200, body: #"{"drawings":"3:1:0","drafts":"9:1:0","files":"0","metadata":"abc:2:17"}"#))
+    let transport = makeTransport()
+    let revisions = try await transport.sync(senderToken: "rd_send_1")
+
+    let (request, _) = try XCTUnwrap(StubURLProtocol.lastRequest)
+    XCTAssertEqual(request.httpMethod, "POST")
+    XCTAssertEqual(request.url?.path, "/v1/sender/sync")
+    XCTAssertNil(request.value(forHTTPHeaderField: "Authorization"))
+    let body = try StubURLProtocol.lastBody()
+    XCTAssertEqual(body["senderToken"] as? String, "rd_send_1")
+    XCTAssertEqual(body.count, 1)
+    XCTAssertEqual(
+      revisions,
+      RemoteDrawSyncRevisions(drawings: "3:1:0", metadata: "abc:2:17", drafts: "9:1:0", files: "0"))
+  }
+
+  func testOnlyABareRouter404MeansSyncIsUnsupported() async throws {
+    let transport = makeTransport()
+    StubURLProtocol.reset(.init(status: 404, body: "No matching routes found"))
+    do {
+      _ = try await transport.sync(senderToken: "rd_send_1")
+      XCTFail("Expected unsupported")
+    } catch is RemoteDrawSyncUnsupportedError {}
+
+    // The API's own 404 names a code and is a real answer about this session.
+    StubURLProtocol.reset(
+      .init(status: 404, body: #"{"error":{"code":"session_not_found","message":"Gone."}}"#))
+    do {
+      _ = try await transport.sync(senderToken: "rd_send_1")
+      XCTFail("Expected a server error")
+    } catch RemoteDrawError.server(let status, let code, _) {
+      XCTAssertEqual(status, 404)
+      XCTAssertEqual(code, "session_not_found")
+    }
   }
 
   // MARK: - Errors

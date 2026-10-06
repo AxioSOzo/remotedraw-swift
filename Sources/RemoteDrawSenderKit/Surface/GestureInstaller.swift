@@ -1,10 +1,9 @@
 //
 //  Installed on the *window*, not on the drawing surface.
 //
-//  Ported verbatim from `apps/ios/RemoteDraw/ErgonomicGestures.swift`, which is
-//  where every one of the comments below was paid for. The only edits are the
-//  `RemoteDraw` prefixes the public names need and the `#if canImport(UIKit)`
-//  guard the package needs to keep compiling on macOS for `swift test`.
+//  Shared by the native app, SDK surface and embedded web sender. Shortcut
+//  arbitration follows physical contacts instead of independent tap recognizers
+//  so a pinch cannot also undo, including when zoom has reached its limit.
 //
 #if canImport(UIKit) && !os(watchOS)
 import SwiftUI
@@ -49,6 +48,12 @@ public struct RemoteDrawTouchSnapshot: Equatable, Sendable {
 /// touches from either.
 public struct RemoteDrawGestureInstaller: UIViewRepresentable {
   public var onTouchChange: (RemoteDrawTouchSnapshot) -> Void
+  /// A genuine new physical touch sequence, before its coalesced samples and
+  /// snapshot. Only a single non-palm contact beginning on this surface fires
+  /// it. Added fingers, leaving/reentering bounds, resets and synthetic empty
+  /// snapshots never begin a new sequence. A host may reset cancellation latches
+  /// here instead of treating a zero-touch snapshot as proof of a new gesture.
+  public var onTouchSequenceBegan: (RemoteDrawTouchSample) -> Void = { _ in }
   public var onTwoFingerTap: () -> Void
   public var onThreeFingerTap: () -> Void
   /// Hardware-predicted locations for the drawing touch, in this view's space.
@@ -79,6 +84,7 @@ public struct RemoteDrawGestureInstaller: UIViewRepresentable {
 
   public init(
     onTouchChange: @escaping (RemoteDrawTouchSnapshot) -> Void,
+    onTouchSequenceBegan: @escaping (RemoteDrawTouchSample) -> Void = { _ in },
     onTwoFingerTap: @escaping () -> Void = {},
     onThreeFingerTap: @escaping () -> Void = {},
     onPredictedTouches: @escaping ([CGPoint]) -> Void = { _ in },
@@ -93,6 +99,7 @@ public struct RemoteDrawGestureInstaller: UIViewRepresentable {
     isActive: Bool = true
   ) {
     self.onTouchChange = onTouchChange
+    self.onTouchSequenceBegan = onTouchSequenceBegan
     self.onTwoFingerTap = onTwoFingerTap
     self.onThreeFingerTap = onThreeFingerTap
     self.onPredictedTouches = onPredictedTouches
@@ -124,6 +131,7 @@ public struct RemoteDrawGestureInstaller: UIViewRepresentable {
 
   public func updateUIView(_ uiView: RemoteDrawGestureHostView, context: Context) {
     context.coordinator.onTouchChange = onTouchChange
+    context.coordinator.onTouchSequenceBegan = onTouchSequenceBegan
     context.coordinator.onTwoFingerTap = onTwoFingerTap
     context.coordinator.onThreeFingerTap = onThreeFingerTap
     context.coordinator.onPredictedTouches = onPredictedTouches
@@ -146,6 +154,7 @@ public struct RemoteDrawGestureInstaller: UIViewRepresentable {
 
   public final class Coordinator: NSObject, UIGestureRecognizerDelegate {
     var onTouchChange: (RemoteDrawTouchSnapshot) -> Void
+    var onTouchSequenceBegan: (RemoteDrawTouchSample) -> Void = { _ in }
     var onTwoFingerTap: () -> Void
     var onThreeFingerTap: () -> Void
     var onPredictedTouches: ([CGPoint]) -> Void = { _ in }
@@ -189,8 +198,6 @@ public struct RemoteDrawGestureInstaller: UIViewRepresentable {
 
     private weak var attachedView: UIView?
     private var touchMonitor: RemoteDrawTouchMonitorRecognizer?
-    private var twoFingerTap: UITapGestureRecognizer?
-    private var threeFingerTap: UITapGestureRecognizer?
     private var longPress: UILongPressGestureRecognizer?
 
     init(
@@ -216,6 +223,9 @@ public struct RemoteDrawGestureInstaller: UIViewRepresentable {
 
       let monitor = RemoteDrawTouchMonitorRecognizer()
       monitor.boundsView = boundsView
+      monitor.onTouchSequenceBegan = { [weak self] sample in
+        self?.onTouchSequenceBegan(sample)
+      }
       monitor.onSnapshot = { [weak self] snapshot in
         self?.onTouchChange(snapshot)
       }
@@ -225,22 +235,25 @@ public struct RemoteDrawGestureInstaller: UIViewRepresentable {
       monitor.onCoalescedSamples = { [weak self] samples in
         self?.onCoalescedSamples(samples)
       }
+      monitor.onContactAction = { [weak self] action in
+        guard let self, self.isActive else { return }
+        switch action {
+        case .undo: if self.isTwoFingerTapEnabled { self.onTwoFingerTap() }
+        case .controls: self.onThreeFingerTap()
+        }
+      }
+      monitor.onLongPressEligibilityChange = { [weak self] allowed in
+        // A second contact owns the rest of this physical sequence, even if
+        // the camera is already clamped and no visible zoom occurs.
+        guard let self else { return }
+        self.longPress?.isEnabled = self.isActive && self.isLongPressEnabled && allowed
+      }
       monitor.delegate = self
       monitor.cancelsTouchesInView = false
       monitor.delaysTouchesBegan = false
       monitor.delaysTouchesEnded = false
       view.addGestureRecognizer(monitor)
       touchMonitor = monitor
-
-      let twoTap = UITapGestureRecognizer(target: self, action: #selector(handleTwoFingerTap(_:)))
-      configureTapRecognizer(twoTap, touches: 2)
-      view.addGestureRecognizer(twoTap)
-      twoFingerTap = twoTap
-
-      let threeTap = UITapGestureRecognizer(target: self, action: #selector(handleThreeFingerTap(_:)))
-      configureTapRecognizer(threeTap, touches: 3)
-      view.addGestureRecognizer(threeTap)
-      threeFingerTap = threeTap
 
       // The summon must cancel touch delivery to the views below it when it
       // recognizes (so a WKWebView draft or a budding stroke dies cleanly),
@@ -266,50 +279,23 @@ public struct RemoteDrawGestureInstaller: UIViewRepresentable {
     /// flags, gated by `isActive`.
     private func applyEnabledStates() {
       touchMonitor?.isEnabled = isActive
-      twoFingerTap?.isEnabled = isActive && isTwoFingerTapEnabled
-      threeFingerTap?.isEnabled = isActive
+      if !isActive { touchMonitor?.invalidateContactActions() }
       longPress?.isEnabled = isActive && isLongPressEnabled
+        && (touchMonitor?.allowsLongPress ?? true)
     }
 
     func detach() {
       if let touchMonitor, let view = touchMonitor.view {
         view.removeGestureRecognizer(touchMonitor)
       }
-      if let twoFingerTap, let view = twoFingerTap.view {
-        view.removeGestureRecognizer(twoFingerTap)
-      }
-      if let threeFingerTap, let view = threeFingerTap.view {
-        view.removeGestureRecognizer(threeFingerTap)
-      }
       if let longPress, let view = longPress.view {
         view.removeGestureRecognizer(longPress)
       }
       touchMonitor = nil
-      twoFingerTap = nil
-      threeFingerTap = nil
       longPress = nil
       attachedView = nil
       onTouchChange(RemoteDrawTouchSnapshot())
       onPredictedTouches([])
-    }
-
-    private func configureTapRecognizer(_ recognizer: UITapGestureRecognizer, touches: Int) {
-      recognizer.numberOfTouchesRequired = touches
-      recognizer.numberOfTapsRequired = 1
-      recognizer.cancelsTouchesInView = false
-      recognizer.delaysTouchesBegan = false
-      recognizer.delaysTouchesEnded = false
-      recognizer.delegate = self
-    }
-
-    @objc private func handleTwoFingerTap(_ recognizer: UITapGestureRecognizer) {
-      guard recognizer.state == .recognized, recognizerIsInsideBounds(recognizer) else { return }
-      onTwoFingerTap()
-    }
-
-    @objc private func handleThreeFingerTap(_ recognizer: UITapGestureRecognizer) {
-      guard recognizer.state == .recognized, recognizerIsInsideBounds(recognizer) else { return }
-      onThreeFingerTap()
     }
 
     @objc private func handleLongPress(_ recognizer: UILongPressGestureRecognizer) {
@@ -317,6 +303,7 @@ public struct RemoteDrawGestureInstaller: UIViewRepresentable {
       let location = recognizer.location(in: boundsView)
       switch recognizer.state {
       case .began:
+        guard touchMonitor?.claimLongPress() == true else { return }
         onLongPressBegan?(location)
       case .changed:
         onLongPressMoved?(location)
@@ -329,9 +316,8 @@ public struct RemoteDrawGestureInstaller: UIViewRepresentable {
       }
     }
 
-    private func recognizerIsInsideBounds(_ recognizer: UIGestureRecognizer) -> Bool {
-      guard let boundsView else { return true }
-      return boundsView.bounds.contains(recognizer.location(in: boundsView))
+    public func gestureRecognizerShouldBegin(_ gestureRecognizer: UIGestureRecognizer) -> Bool {
+      gestureRecognizer !== longPress || touchMonitor?.allowsLongPress == true
     }
 
     public func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
@@ -378,6 +364,60 @@ public final class RemoteDrawGestureHostView: UIView {
 final class RemoteDrawTouchMonitorRecognizer: UIGestureRecognizer {
   weak var boundsView: UIView?
   var onSnapshot: ((RemoteDrawTouchSnapshot) -> Void)?
+  var onTouchSequenceBegan: ((RemoteDrawTouchSample) -> Void)?
+  /// Physical identity is independent of surface bounds and palm classification.
+  /// Keep it through recognizer resets; reconcile against each real UIEvent so
+  /// touches that ended while the recognizer was disabled cannot stay stale.
+  private var physicalTouches: Set<UITouch> = []
+  private var contactGate = RemoteDrawContactGestureGate()
+  private var contactIds: [UITouch: Int] = [:]
+  private var nextContactId = 0
+  var onContactAction: ((RemoteDrawContactAction) -> Void)?
+  var onLongPressEligibilityChange: ((Bool) -> Void)?
+  var allowsLongPress: Bool { contactGate.allowsLongPress }
+
+  func invalidateContactActions() {
+    contactGate.invalidate()
+  }
+
+  func claimLongPress() -> Bool { contactGate.claimLongPress() }
+
+  private func updateContactActions(_ touches: Set<UITouch>, event: UIEvent) {
+    // Reconcile contacts which ended while this monitor was disabled. A UIKit
+    // reset alone never releases a physical contact or resets the gate.
+    let present = event.allTouches ?? touches
+    for (touch, id) in contactIds where !present.contains(touch) {
+      contactGate.cancelled(contact: id)
+      contactIds.removeValue(forKey: touch)
+    }
+    for touch in touches {
+      let point = touch.location(in: boundsView)
+      switch touch.phase {
+      case .began:
+        guard touchIsInsideBounds(touch, of: boundsView), contactIds[touch] == nil else { continue }
+        nextContactId += 1
+        contactIds[touch] = nextContactId
+        contactGate.began(contact: nextContactId, position: point, timestamp: touch.timestamp,
+          isPencilLike: touch.type != .direct || RemoteDrawTouchClassifier.isPalm(majorRadius: touch.majorRadius))
+      case .moved, .stationary:
+        guard let id = contactIds[touch] else { continue }
+        for sample in event.coalescedTouches(for: touch) ?? [touch] {
+          contactGate.moved(contact: id, position: sample.location(in: boundsView), timestamp: sample.timestamp)
+        }
+        if RemoteDrawTouchClassifier.isPalm(majorRadius: touch.majorRadius) { contactGate.invalidate() }
+      case .ended:
+        guard let id = contactIds.removeValue(forKey: touch) else { continue }
+        if let action = contactGate.ended(contact: id, position: point, timestamp: touch.timestamp) {
+          onContactAction?(action)
+        }
+      case .cancelled:
+        guard let id = contactIds.removeValue(forKey: touch) else { continue }
+        contactGate.cancelled(contact: id)
+      default: break
+      }
+    }
+    onLongPressEligibilityChange?(allowsLongPress)
+  }
   /// Where UIKit thinks the drawing finger is about to be, in `boundsView`
   /// space. Preview-only latency compensation; see
   /// `InkRenderer.previewPointsWithPrediction`.
@@ -395,12 +435,24 @@ final class RemoteDrawTouchMonitorRecognizer: UIGestureRecognizer {
   private var lastPredicted: [CGPoint] = []
 
   override func touchesBegan(_ touches: Set<UITouch>, with event: UIEvent) {
+    let active = physicalContacts(in: event, fallback: touches)
+    let prior = physicalTouches.intersection(active).union(active.subtracting(touches))
+    physicalTouches = active
+    updateContactActions(touches, event: event)
+    if prior.isEmpty, active.count == 1, touches.count == 1,
+      let touch = touches.first, touch.phase == .began,
+      touchIsInsideBounds(touch, of: boundsView) {
+      let captured = sample(from: touch)
+      if !captured.isPalm { onTouchSequenceBegan?(captured) }
+    }
     publishCoalesced(from: event)
     publishSnapshot(from: event)
     publishPredicted(from: event)
   }
 
   override func touchesMoved(_ touches: Set<UITouch>, with event: UIEvent) {
+    physicalTouches = physicalContacts(in: event, fallback: physicalTouches.union(touches))
+    updateContactActions(touches, event: event)
     // Before the snapshot, deliberately: the snapshot is what a host uses to
     // decide a touch is a palm or a pinch and stand the stroke down, so the
     // samples for the event have to be in the host's hands by the time it makes
@@ -411,6 +463,8 @@ final class RemoteDrawTouchMonitorRecognizer: UIGestureRecognizer {
   }
 
   override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent) {
+    physicalTouches = physicalContacts(in: event, fallback: physicalTouches.subtracting(touches))
+    updateContactActions(touches, event: event)
     // The lift carries samples too — the last few millimetres of a flick live
     // in this event and nowhere else.
     publishCoalesced(from: event)
@@ -422,6 +476,8 @@ final class RemoteDrawTouchMonitorRecognizer: UIGestureRecognizer {
   }
 
   override func touchesCancelled(_ touches: Set<UITouch>, with event: UIEvent) {
+    physicalTouches = physicalContacts(in: event, fallback: physicalTouches.subtracting(touches))
+    updateContactActions(touches, event: event)
     let snapshot = publishSnapshot(from: event)
     publishPredicted([])
     if snapshot.activeTouchCount == 0 {
@@ -437,7 +493,15 @@ final class RemoteDrawTouchMonitorRecognizer: UIGestureRecognizer {
     false
   }
 
+  private func physicalContacts(in event: UIEvent, fallback: Set<UITouch>) -> Set<UITouch> {
+    Set((event.allTouches ?? fallback).filter {
+      $0.phase != .ended && $0.phase != .cancelled
+    })
+  }
+
   override func reset() {
+    // UIKit resets the recognizer, not necessarily the physical contact. Never
+    // emit a new sequence or clear physical identity from this synthetic path.
     publishSnapshot(RemoteDrawTouchSnapshot())
     publishPredicted([])
   }

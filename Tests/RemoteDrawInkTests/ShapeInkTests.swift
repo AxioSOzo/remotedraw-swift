@@ -26,6 +26,19 @@ final class ShapeInkTests: XCTestCase {
     NormalizedPoint(x: 0.7, y: 0.6),
   ]
 
+  func testPressurelessInkDynamicsDoNotChangeWithProjectionZoom() {
+    let board = [NormalizedPoint(x: 0.2, y: 0.3, t: 0),
+      NormalizedPoint(x: 0.35, y: 0.5, t: 24), NormalizedPoint(x: 0.5, y: 0.6, t: 48)]
+    let expected = InkRenderer.widthFactors(for: board)
+    for zoom in [0.1, 0.5, 2.0, 8.0] {
+      let phone = board.map { NormalizedPoint(x: ($0.x - 0.5) / zoom,
+        y: ($0.y - 0.5) / zoom, t: $0.t) }
+      let actual = InkRenderer.widthFactors(for: phone,
+        coordinateScale: CGSize(width: zoom, height: zoom))
+      for (left, right) in zip(actual, expected) { XCTAssertEqual(left, right, accuracy: 1e-12) }
+    }
+  }
+
   func testClaimsExactlyTheTypesShapeAssistSnapsTo() {
     for type in ["line", "arrow", "rectangle", "ellipse"] {
       XCTAssertTrue(InkRenderer.isInkShapeType(type))

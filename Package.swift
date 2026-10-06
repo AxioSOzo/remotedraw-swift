@@ -2,9 +2,10 @@
 
 import PackageDescription
 
-/// RemoteDraw's Swift sender SDK.
+/// RemoteDraw's Swift SDK: the phone-side sender and the surface-side receiver.
 ///
-/// Two targets, split the way `docs/plans/ios-sender-sdk.md` §9.1 asks for:
+/// Three library targets. The first two are split the way
+/// `docs/plans/ios-sender-sdk.md` §9.1 asks for:
 ///
 /// - `RemoteDrawInk` — the tapered dynamic ribbons, shared with the web
 ///   (`packages/client/src/inkGeometry.ts`) and with the first-party app.
@@ -14,8 +15,13 @@ import PackageDescription
 /// - `RemoteDrawSenderKit` — the headless sender: capture, codec, budgets,
 ///   transport, session lifecycle. Re-exports `RemoteDrawInk`, so a customer
 ///   writes one `import`.
+/// - `RemoteDrawReceiverKit` — the surface side: HTTP receiver transport, the
+///   polling store, pairing QR and the SwiftUI board. It draws through the same
+///   `RemoteDrawInk` target (re-exported), so a receiver paints exactly the mark
+///   the sender drew and an app importing both kits sees one set of ink types.
+///   Its sample/dev harness lives in `sdks/swift-receiver`.
 ///
-/// Deliberately one *package* with two targets rather than two packages: §8.3
+/// Deliberately one *package* with several targets rather than packages: §8.3
 /// exports `apps/ios/RemoteDrawSenderKit/**` into the public mirror and runs
 /// `swift test` there to prove the export is self-contained, which a
 /// cross-package dependency would break.
@@ -30,6 +36,7 @@ let package = Package(
   ],
   products: [
     .library(name: "RemoteDrawSenderKit", targets: ["RemoteDrawSenderKit"]),
+    .library(name: "RemoteDrawReceiverKit", targets: ["RemoteDrawReceiverKit"]),
     .library(name: "RemoteDrawInk", targets: ["RemoteDrawInk"]),
   ],
   targets: [
@@ -45,6 +52,10 @@ let package = Package(
         .copy("Resources/PrivacyInfo.xcprivacy")
       ]
     ),
+    // No privacy manifest of its own: the receiver and the renderer use no
+    // required-reason APIs and collect nothing — they only read a session the
+    // host's backend created.
+    .target(name: "RemoteDrawReceiverKit", dependencies: ["RemoteDrawInk"]),
     // The renderer's own tests. A separate bundle because they reach
     // `InkRenderer` internals — the surface table, the profile constants, the
     // frame-cost measurements — and `@testable import` only reaches into the
@@ -71,8 +82,14 @@ let package = Package(
         // into the public mirror and runs `swift test` there: a path out of the
         // package would make that export a lie. Re-copy it when the shared table
         // changes; `MapGeometryTests` fails loudly if the two drift.
-        .copy("Fixtures/mapBoardGeometryVectors.json")
+        .copy("Fixtures/mapBoardGeometryVectors.json"),
+        // A verbatim copy of `packages/protocol/tests/fixtures/drawingChanges.json`,
+        // the incremental drawings-read scenarios the TypeScript reader and
+        // RemoteDrawKit run too. Copied for the same reason as above;
+        // `packages/protocol/tests/drawingChanges.test.ts` fails if it drifts.
+        .copy("Fixtures/drawingChanges.json"),
       ]
     ),
+    .testTarget(name: "RemoteDrawReceiverKitTests", dependencies: ["RemoteDrawReceiverKit"]),
   ]
 )

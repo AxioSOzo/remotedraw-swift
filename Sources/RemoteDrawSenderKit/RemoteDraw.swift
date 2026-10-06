@@ -27,7 +27,7 @@ import os
 public final class RemoteDraw: @unchecked Sendable {
   /// The version this build reports in `X-RemoteDraw-SDK`, and the one a
   /// `clientAdvisory` compares against.
-  public static let sdkVersion = "0.3.0"
+  public static let sdkVersion = "0.4.0"
 
   private static let lock = NSLock()
   nonisolated(unsafe) private static var _shared: RemoteDraw?

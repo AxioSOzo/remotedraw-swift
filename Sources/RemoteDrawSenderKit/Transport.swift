@@ -58,6 +58,32 @@ public protocol RemoteDrawSenderTransport: Sendable {
   ///   as connected for up to the receiver's 60 s window, so an SDK that exits
   ///   cleanly must call this or the customer's board lies about who is there.
   func closeProjection(senderToken: String, disconnect: Bool) async throws
+
+  /// Reads the board's revision tokens: `POST /v1/sender/sync`.
+  ///
+  /// The session polls this about once a second and reads a snapshot only when
+  /// a token moved. A transport that cannot answer must throw
+  /// ``RemoteDrawSyncUnsupportedError`` — the default does — and the session
+  /// falls back to unconditional snapshots every five seconds. Any other error
+  /// is a transient failure and the next tick retries.
+  func sync(senderToken: String) async throws -> RemoteDrawSyncRevisions
+}
+
+/// Thrown by a transport that has no `/v1/sender/sync`.
+///
+/// Its own type rather than a ``RemoteDrawError`` case, because it is a
+/// statement about the transport and never about the session: nothing recovers
+/// from it, and the session only uses it to choose the legacy snapshot cadence.
+public struct RemoteDrawSyncUnsupportedError: Error, Equatable, Sendable {
+  public init() {}
+}
+
+extension RemoteDrawSenderTransport {
+  /// Custom transports written before sync existed keep compiling and keep
+  /// working, on the slower snapshot cadence.
+  public func sync(senderToken: String) async throws -> RemoteDrawSyncRevisions {
+    throw RemoteDrawSyncUnsupportedError()
+  }
 }
 
 // MARK: - Requests
@@ -77,6 +103,7 @@ public struct RemoteDrawDraftRequest: Encodable, Sendable {
   public let packedPoints: String
   public let text: String?
   public let phoneProjection: RemoteDrawProjection?
+  public let annotationRevision: Int?
   public let occurredAt: Double
 
   public init(
@@ -87,6 +114,7 @@ public struct RemoteDrawDraftRequest: Encodable, Sendable {
     style: RemoteDrawDrawingStyle? = nil,
     text: String? = nil,
     phoneProjection: RemoteDrawProjection? = nil,
+    annotationRevision: Int? = nil,
     pointerType: String = "touch",
     occurredAt: Double = Date().timeIntervalSince1970 * 1000
   ) {
@@ -101,6 +129,7 @@ public struct RemoteDrawDraftRequest: Encodable, Sendable {
       RemoteDrawStrokeBudget.forDraft(points, limit: RemoteDrawProtocolLimits.maxDraftPoints))
     self.text = text.map { String($0.prefix(RemoteDrawProtocolLimits.maxTextLength)) }
     self.phoneProjection = phoneProjection
+    self.annotationRevision = annotationRevision
     self.occurredAt = occurredAt.rounded(.down)
   }
 }
@@ -111,7 +140,7 @@ public struct RemoteDrawDraftRequest: Encodable, Sendable {
 /// `(sessionId, senderId, clientStrokeId)` and a replay answers
 /// `duplicate: true`, which is what makes retrying a timed-out commit safe.
 public struct RemoteDrawCommitRequest: Encodable, Sendable {
-  public let senderToken: String
+  public internal(set) var senderToken: String
   public let clientStrokeId: String
   public let sequence: Int
   public let pointerType: String
@@ -120,6 +149,7 @@ public struct RemoteDrawCommitRequest: Encodable, Sendable {
   public let packedPoints: String
   public let text: String?
   public let phoneProjection: RemoteDrawProjection?
+  public let annotationRevision: Int?
   public let occurredAt: Double
 
   public init(
@@ -131,6 +161,7 @@ public struct RemoteDrawCommitRequest: Encodable, Sendable {
     style: RemoteDrawDrawingStyle? = nil,
     text: String? = nil,
     phoneProjection: RemoteDrawProjection? = nil,
+    annotationRevision: Int? = nil,
     pointerType: String = "touch",
     occurredAt: Double = Date().timeIntervalSince1970 * 1000
   ) {
@@ -147,6 +178,7 @@ public struct RemoteDrawCommitRequest: Encodable, Sendable {
       RemoteDrawStrokeBudget.thin(points, limit: RemoteDrawProtocolLimits.maxCommitPoints))
     self.text = text.map { String($0.prefix(RemoteDrawProtocolLimits.maxTextLength)) }
     self.phoneProjection = phoneProjection
+    self.annotationRevision = annotationRevision
     self.occurredAt = occurredAt.rounded(.down)
   }
 }
@@ -190,7 +222,7 @@ public enum RemoteDrawAPIBaseURL: Equatable, Sendable {
   }
 }
 
-/// The fourteen sender routes over HTTPS.
+/// The sixteen sender routes (``RemoteDrawSenderRoute``) over HTTPS.
 ///
 /// The only thing in the package that knows a network exists.
 public struct RemoteDrawSenderHTTPTransport: RemoteDrawSenderTransport {
@@ -200,6 +232,8 @@ public struct RemoteDrawSenderHTTPTransport: RemoteDrawSenderTransport {
   private let appDeviceToken: (@Sendable () -> String?)?
   private let advisories: RemoteDrawAdvisoryReporter
   private let decoder = JSONDecoder()
+  /// Incremental-sync state for the board being read (shared by copies).
+  private let drawingChanges = RemoteDrawDrawingChangesState()
 
   /// - Parameter appDeviceToken: a RemoteDraw **account** credential, forwarded
   ///   verbatim on `/v1/join` and on no other route.
@@ -363,8 +397,58 @@ public struct RemoteDrawSenderHTTPTransport: RemoteDrawSenderTransport {
     return try await post(.edit, body: Body(senderToken: senderToken, edit: edit))
   }
 
+  /// Asks for packed points (~8 B/point instead of ~50 as JSON). The response
+  /// decodes either dialect, so a server that predates `encoding` — and so
+  /// ignores it — still works.
+  ///
+  /// Incremental too: after the first read (`since: ""`) it sends the previous
+  /// answer's `cursor` as `since` and applies what changed (`items` upserted,
+  /// `removedIds` gone, or the whole board on `reset`), so a commit costs one
+  /// stroke rather than the board. A board too big for one answer arrives in
+  /// pages (`pageSize`), followed in the same call, then settled by one more
+  /// delta. It still returns the whole board, in paint order, with a
+  /// whole-list `payload`. If the result disagrees with `activeCount` it reads
+  /// the whole board again in the same call; a server without `since` answers
+  /// a plain whole list, returned as is. A delta read refused as malformed
+  /// (`400 invalid_request`) or for a token or session that is gone drops the
+  /// cursor, so the next call reads the whole board; other failures keep it
+  /// (`refusesDrawingsRequest`). See `RemoteDrawDrawingChangesState`.
   public func drawings(senderToken: String) async throws -> RemoteDrawDrawingsResponse {
-    try await post(.drawings, body: TokenBody(senderToken: senderToken))
+    struct Body: Encodable {
+      let senderToken: String
+      let encoding = "packed"
+      let since: String
+      let pageSize = RemoteDrawDrawingChangesState.pageSize
+      let pageToken: String?
+    }
+    let held = drawingChanges.begin(key: senderToken)
+    for _ in 0..<RemoteDrawDrawingChangesState.maxRequests {
+      let request = drawingChanges.request(for: senderToken)
+      let data: Data
+      do {
+        data = try await postRaw(
+          .drawings,
+          body: Body(senderToken: senderToken, since: request.since, pageToken: request.pageToken))
+      } catch {
+        // A refused request drops the cursor; see `refusesDrawingsRequest`.
+        let refused = (error as? RemoteDrawError)?.refusesDrawingsRequest ?? false
+        drawingChanges.failed(key: senderToken, held: held, refused: refused)
+        throw error
+      }
+      let answer: RemoteDrawDrawingChangesAnswer
+      do {
+        answer = try decoder.decode(RemoteDrawDrawingChangesAnswer.self, from: data)
+      } catch {
+        drawingChanges.failed(key: senderToken, held: held, refused: false)
+        throw RemoteDrawError.decoding("\(RemoteDrawSenderRoute.drawings.rawValue): \(error)")
+      }
+      if case .board(let response) = drawingChanges.apply(answer, key: senderToken, request: request) {
+        return response
+      }
+    }
+    drawingChanges.abandon(key: senderToken)
+    throw RemoteDrawError.decoding(
+      "\(RemoteDrawSenderRoute.drawings.rawValue): the read did not settle; it will start over")
   }
 
   public func updateProjection(senderToken: String, projection: RemoteDrawProjection) async throws
@@ -392,6 +476,20 @@ public struct RemoteDrawSenderHTTPTransport: RemoteDrawSenderTransport {
   /// through ``retryIdempotentRequest``. See the protocol requirement for why.
   public func refresh(senderToken: String) async throws -> RemoteDrawRefreshResponse {
     try await post(.refresh, body: TokenBody(senderToken: senderToken))
+  }
+
+  /// `POST /v1/sender/sync`.
+  ///
+  /// A bare 404 — no error code, which is the router's "no such route" rather
+  /// than the API's `session_not_found` — means a deployment that predates the
+  /// route, and is reported as unsupported so the session falls back instead of
+  /// retrying a route that will never answer.
+  public func sync(senderToken: String) async throws -> RemoteDrawSyncRevisions {
+    do {
+      return try await post(.sync, body: TokenBody(senderToken: senderToken))
+    } catch RemoteDrawError.server(let status, let code, _) where status == 404 && code == nil {
+      throw RemoteDrawSyncUnsupportedError()
+    }
   }
 
   // MARK: Plumbing
@@ -519,11 +617,15 @@ public struct RemoteDrawSenderHTTPTransport: RemoteDrawSenderTransport {
         retryAfter: envelope?.retryAfter ?? header ?? 1, bucket: envelope?.code)
     default:
       let envelope = try? decoder.decode(ErrorEnvelope.self, from: data)
+      // The API has one code for a finished board, `session_not_active`, and
+      // deliberately does not say whether it ended or expired: the distinction
+      // lives on the session payload's `status`, which a sender already holds.
+      // `RemoteDrawSenderSession` refines this into `.sessionExpired` from the
+      // `expiresAt` it last read — see `recover(from:)` — because the transport
+      // has no session to compare against. (A `session_expired` code was
+      // matched here for a while; the server never sent it.)
       if envelope?.code == "session_not_active" {
         throw RemoteDrawError.sessionEnded
-      }
-      if envelope?.code == "session_expired" {
-        throw RemoteDrawError.sessionExpired
       }
       throw RemoteDrawError.server(
         status: http.statusCode, code: envelope?.code, message: envelope?.message)

@@ -23,8 +23,14 @@ public enum RemoteDrawProtocolLimits: Sendable {
   public static let draftSendInterval: TimeInterval = 0.032
   /// Viewport sync cadence: 45 ms.
   public static let projectionSyncInterval: TimeInterval = 0.045
-  /// Presence heartbeat: 5 s. The receiver's presence window is 60 s.
+  /// Presence heartbeat: 5 s. Matches `REMOTEDRAW_LIMITS.senderHeartbeatIntervalMs`.
   public static let presenceInterval: TimeInterval = 5
+  /// How long the board keeps calling this phone `present` after its last
+  /// heartbeat: 60 s, twelve beats. Matches
+  /// `REMOTEDRAW_LIMITS.senderPresenceWindowMs`, which the API's `presence`
+  /// field on `POST /v1/receiver/senders` is derived from — so what a host
+  /// reads here is exactly what the customer's receiver will show.
+  public static let presenceWindow: TimeInterval = 60
 
   /// Points in one live draft frame.
   public static let maxDraftPoints = 180

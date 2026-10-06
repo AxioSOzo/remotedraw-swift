@@ -52,7 +52,7 @@ public enum PointCodec {
   private static let tMax = 2_147_483_647.0
 
   private static let base64url = Array(
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_".utf8)
 
   private struct Writer {
     var bytes: [UInt8] = []
@@ -185,7 +185,7 @@ public enum PointCodec {
   }
 
   private static func toBase64Url(_ bytes: [UInt8]) -> String {
-    var out = ""
+    var out: [UInt8] = []
     out.reserveCapacity((bytes.count + 2) / 3 * 4)
     var index = 0
     while index < bytes.count {
@@ -200,12 +200,23 @@ public enum PointCodec {
       out.append(base64url[Int(c! & 63)])
       index += 3
     }
-    return out
+    return String(decoding: out, as: UTF8.self)
   }
 
-  private static let base64urlIndex: [Character: UInt8] = {
+  private static let base64urlIndex: [Int16] = {
+    var table = [Int16](repeating: -1, count: 128)
+    for (index, byte) in base64url.enumerated() {
+      table[Int(byte)] = Int16(index)
+    }
+    return table
+  }()
+
+  // Keep Character lookup on the uncommon fallback: Swift's canonical Unicode
+  // equivalence and the public invalidCharacter payload belong to this codec's
+  // existing behavior, even though emitted base64url is always ASCII.
+  private static let base64urlCharacterIndex: [Character: UInt8] = {
     var table: [Character: UInt8] = [:]
-    for (index, character) in base64url.enumerated() {
+    for (index, character) in String(decoding: base64url, as: UTF8.self).enumerated() {
       table[character] = UInt8(index)
     }
     return table
@@ -213,11 +224,30 @@ public enum PointCodec {
 
   private static func fromBase64Url(_ text: String) throws -> [UInt8] {
     var bytes: [UInt8] = []
+    bytes.reserveCapacity(text.utf8.count * 3 / 4 + 1)
+    var accumulator: UInt32 = 0
+    var bits = 0
+    for byte in text.utf8 {
+      guard byte < 128, base64urlIndex[Int(byte)] >= 0 else {
+        return try fromBase64Characters(text)
+      }
+      accumulator = (accumulator << 6) | UInt32(base64urlIndex[Int(byte)])
+      bits += 6
+      if bits >= 8 {
+        bits -= 8
+        bytes.append(UInt8((accumulator >> UInt32(bits)) & 0xff))
+      }
+    }
+    return bytes
+  }
+
+  private static func fromBase64Characters(_ text: String) throws -> [UInt8] {
+    var bytes: [UInt8] = []
     bytes.reserveCapacity(text.count * 3 / 4 + 1)
     var accumulator: UInt32 = 0
     var bits = 0
     for character in text {
-      guard let value = base64urlIndex[character] else {
+      guard let value = base64urlCharacterIndex[character] else {
         throw RemoteDrawPointCodecError.invalidCharacter(character)
       }
       accumulator = (accumulator << 6) | UInt32(value)
@@ -308,6 +338,16 @@ public enum PointCodec {
         ))
     }
     return points
+  }
+}
+
+extension PointCodec {
+  /// A served stroke's points for display: the stroke-size cap the server
+  /// enforces, and an empty stroke rather than a throw for a stream that does
+  /// not decode — one corrupt element must not cost the board, which is what
+  /// `decodeDrawingItems` does on the TypeScript side.
+  static func unpackForDisplay(_ packed: String) -> [RemoteDrawNormalizedPoint] {
+    (try? unpack(packed, maxPoints: RemoteDrawProtocolLimits.maxCommitPoints)) ?? []
   }
 }
 

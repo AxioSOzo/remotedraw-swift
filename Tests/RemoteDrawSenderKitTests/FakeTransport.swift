@@ -8,7 +8,11 @@ import Foundation
 /// healing, the re-join contract, presence, clean exit — is a rule about *what
 /// the sender does with an answer*, so it is verifiable without a socket. That
 /// is the whole reason ``RemoteDrawSenderTransport`` is a protocol.
-final class FakeTransport: RemoteDrawSenderTransport, @unchecked Sendable {
+// Tests configure and inspect this script on the main actor. Keep request
+// bookkeeping there too: concurrent replays must not mutate its arrays from
+// different transport executor threads.
+@MainActor
+final class FakeTransport: RemoteDrawSenderTransport {
   struct Call: Equatable {
     let route: RemoteDrawSenderRoute
     let senderToken: String
@@ -39,13 +43,53 @@ final class FakeTransport: RemoteDrawSenderTransport, @unchecked Sendable {
   var joinResult: Result<RemoteDrawJoinResponse, Error> = .success(
     RemoteDrawJoinResponse(senderToken: "rd_send_1", senderId: "sender_1", capabilities: ["draw"]))
   var sessionResult: Result<RemoteDrawSessionResponse, Error>?
+  var sessionHook: (() async throws -> RemoteDrawSessionResponse)?
+  private var automaticPollClock: ManualPollClock?
+
+  /// Park automatic sync and heartbeat work without backgrounding the sender.
+  /// Manual reads and drawing still exercise normal foreground admission. The
+  /// first sync has no initial timer, so freezing just the sleep clock is not
+  /// enough: hold that request too. Cancellation releases it on teardown.
+  func holdAutomaticPolling() -> ManualPollClock {
+    let clock = ManualPollClock()
+    automaticPollClock = clock
+    return clock
+  }
+
+  /// The first presence beat does not sleep. Let it finish before a fixture
+  /// creates pending ink, or that startup beat can race its explicit retry.
+  @MainActor
+  func settleStartup() async {
+    guard let clock = automaticPollClock else {
+      preconditionFailure("Hold automatic polling before settling fixture startup")
+    }
+    await clock.settle()
+  }
+
   var draftResults: [RemoteDrawDraftAck] = []
   var draftError: Error?
+  var draftDelayNanoseconds: UInt64 = 0
+  private var _draftStartedAt: [TimeInterval] = []
+  var draftStartedAt: [TimeInterval] {
+    lock.lock()
+    defer { lock.unlock() }
+    return _draftStartedAt
+  }
+  private func recordDraftStart() {
+    lock.lock()
+    _draftStartedAt.append(ProcessInfo.processInfo.systemUptime)
+    lock.unlock()
+  }
   var commitResult: Result<RemoteDrawCommitResult, Error>?
   /// Runs before the canned answer, so a test can fail the first N attempts.
   /// A closure rather than a subclass because the failure is per-test and the
   /// recording underneath it is not.
   var commitHook: ((Int) throws -> Void)?
+  var commitAsyncHook: ((RemoteDrawCommitRequest) async throws -> Void)?
+  var refreshHook: (() async throws -> Void)?
+  var pingHook: ((String, Bool) async throws -> Void)?
+  var draftHook: (() async throws -> Void)?
+  private(set) var commitRequests: [RemoteDrawCommitRequest] = []
   var submitHook: ((Int, String) throws -> Void)?
   var undoResult = RemoteDrawUndoResult(removed: true, drawingId: nil)
   var clearResult = RemoteDrawClearResult(removed: 3)
@@ -66,12 +110,20 @@ final class FakeTransport: RemoteDrawSenderTransport, @unchecked Sendable {
   /// Every distinct idempotency key the session used. More than one across a
   /// retry means a second submission, not a retry.
   private(set) var submissionIds: Set<String> = []
+  var drawingsAsyncHook: (() async throws -> Void)?
+  var drawingsJSON = #"{"items":[]}"#
   var editResultJSON = #"{"accepted":true,"kind":"setProperties","editId":"e1","elements":[]}"#
   private(set) var lastEditBody: String??
   private(set) var lastPingWasActive: Bool?
   private(set) var lastCloseWasDisconnect: Bool?
 
   // MARK: Conformance
+
+  func sync(senderToken: String) async throws -> RemoteDrawSyncRevisions {
+    if let clock = automaticPollClock { try await clock.sleep(seconds: 1) }
+    // Preserve the legacy fake's default behavior for all other fixtures.
+    throw RemoteDrawSyncUnsupportedError()
+  }
 
   func join(joinToken: String, device: RemoteDrawSenderDevice?) async throws
     -> RemoteDrawJoinResponse
@@ -82,6 +134,7 @@ final class FakeTransport: RemoteDrawSenderTransport, @unchecked Sendable {
 
   func session(senderToken: String) async throws -> RemoteDrawSessionResponse {
     record(.session, senderToken)
+    if let sessionHook { return try await sessionHook() }
     guard let sessionResult else {
       return RemoteDrawSessionResponse(
         senderId: "sender_1",
@@ -96,11 +149,15 @@ final class FakeTransport: RemoteDrawSenderTransport, @unchecked Sendable {
   func ping(senderToken: String, active: Bool) async throws {
     record(.ping, senderToken)
     lastPingWasActive = active
+    try await pingHook?(senderToken, active)
   }
 
   func updateDraft(_ request: RemoteDrawDraftRequest) async throws -> RemoteDrawDraftAck {
     record(.draft, request.senderToken, request.sequence)
     lastDraftPacked = request.packedPoints
+    recordDraftStart()
+    try await draftHook?()
+    if draftDelayNanoseconds > 0 { try await Task.sleep(nanoseconds: draftDelayNanoseconds) }
     if let draftError { throw draftError }
     if draftResults.isEmpty { return RemoteDrawDraftAck(accepted: true) }
     return draftResults.removeFirst()
@@ -109,9 +166,11 @@ final class FakeTransport: RemoteDrawSenderTransport, @unchecked Sendable {
   func commitStroke(_ request: RemoteDrawCommitRequest) async throws -> RemoteDrawCommitResult {
     record(.commit, request.senderToken, request.sequence)
     commitAttempts += 1
+    commitRequests.append(request)
     lastCommitClientStrokeId = request.clientStrokeId
     lastCommitPoints = try? PointCodec.unpack(request.packedPoints)
     lastCommitTool = request.tool
+    try await commitAsyncHook?(request)
     try commitHook?(commitAttempts)
     guard let commitResult else {
       return RemoteDrawCommitResult(
@@ -167,7 +226,9 @@ final class FakeTransport: RemoteDrawSenderTransport, @unchecked Sendable {
 
   func drawings(senderToken: String) async throws -> RemoteDrawDrawingsResponse {
     record(.drawings, senderToken)
-    return RemoteDrawDrawingsResponse(session: nil, items: [])
+    let response = try JSONDecoder().decode(RemoteDrawDrawingsResponse.self, from: Data(drawingsJSON.utf8))
+    try await drawingsAsyncHook?()
+    return response
   }
 
   func updateProjection(senderToken: String, projection: RemoteDrawProjection) async throws
@@ -180,6 +241,7 @@ final class FakeTransport: RemoteDrawSenderTransport, @unchecked Sendable {
   func refresh(senderToken: String) async throws -> RemoteDrawRefreshResponse {
     record(.refresh, senderToken)
     refreshAttempts += 1
+    try await refreshHook?()
     return try refreshResult.get()
   }
 

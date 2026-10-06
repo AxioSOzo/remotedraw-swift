@@ -220,6 +220,21 @@ final class PointCodecTests: XCTestCase {
 
   // MARK: - Decoder robustness
 
+  func testInvalidCharactersKeepTheirCompleteGraphemeInTheError() {
+    for invalid in ["=", " ", "\r\n", "é", "A\u{301}", "👨‍👩‍👧‍👦"] {
+      XCTAssertThrowsError(try PointCodec.unpack("AQABAAA-" + invalid)) { error in
+        XCTAssertEqual(error as? RemoteDrawPointCodecError, .invalidCharacter(Character(invalid)))
+      }
+    }
+  }
+
+  func testUnicodeCanonicalEquivalenceKeepsTheExistingDecoderBehavior() throws {
+    // Character dictionary lookup historically accepts the Kelvin sign as K.
+    // Valid emitted wire remains ASCII; callers of this public decoder retain
+    // the same result for a canonically equivalent Unicode spelling.
+    XCTAssertEqual(try PointCodec.unpack("AQABAAK"), try PointCodec.unpack("AQABAAK"))
+  }
+
   func testRejectsMalformedInputRatherThanReturningAPartialStroke() throws {
     // A half-decoded stroke would render as a real one.
     XCTAssertThrowsError(try PointCodec.unpack("!!!not base64!!!"))

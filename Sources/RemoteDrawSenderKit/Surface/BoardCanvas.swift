@@ -12,10 +12,13 @@ import SwiftUI
 public struct RemoteDrawBoardMark: Identifiable, Equatable, Sendable {
   public let id: String
   /// Protocol drawing type: `freehand`, `line`, `rectangle`, `ellipse`,
-  /// `arrow`, `point`, `text`, `auto`.
+  /// `arrow`, `point`, `text`, `auto`, `image`. Image marks use four projected
+  /// corners in top-left, top-right, bottom-right, bottom-left order; a two-point
+  /// unprojected image box is also accepted by the initializer.
   public let type: String
   public let points: [RemoteDrawNormalizedPoint]
   public let text: String?
+  public let imageUrl: String?
   public let style: RemoteDrawDrawingStyle?
   /// Overrides the appearance's default width. The board's own committed
   /// content is painted at 6 the way the first-party app paints it; the live
@@ -27,13 +30,15 @@ public struct RemoteDrawBoardMark: Identifiable, Equatable, Sendable {
     type: String = "freehand",
     points: [RemoteDrawNormalizedPoint],
     text: String? = nil,
+    imageUrl: String? = nil,
     style: RemoteDrawDrawingStyle? = nil,
     lineWidth: CGFloat? = nil
   ) {
     self.id = id
     self.type = type
-    self.points = points
+    self.points = type == "image" && points.count == 2 ? RemoteDrawImageGeometry.corners(points) : points
     self.text = text
+    self.imageUrl = imageUrl
     self.style = style
     self.lineWidth = lineWidth
   }
@@ -69,10 +74,32 @@ public struct RemoteDrawBoardTransform: Equatable, Sendable {
 public struct RemoteDrawBoardSection: Equatable, Sendable {
   public var marks: [RemoteDrawBoardMark]
   public var transform: RemoteDrawBoardTransform?
+  /// The whole section's alpha. `1` for content; less for a proposal — the
+  /// shape-snap ghost, and the hand-drawn ink it would replace, are painted
+  /// through this so the two read as "this becomes that".
+  public var opacity: Double
+  /// Content units to display points. Geometry and ink are painted in the
+  /// same virtual canvas before scaling, including the tooth-mask bounds.
+  public var contentPixelScale: Double
+  public var dynamicsReferenceExtent: Double? = nil
 
-  public init(marks: [RemoteDrawBoardMark], transform: RemoteDrawBoardTransform? = nil) {
+  public func withContentPixelScale(_ scale: Double, referenceExtent: Double = 1000) -> Self {
+    var result = self
+    result.contentPixelScale = scale.isFinite && scale > 0 ? scale : 1
+    result.dynamicsReferenceExtent = referenceExtent.isFinite && referenceExtent > 0 ? referenceExtent : 1000
+    return result
+  }
+
+  public init(
+    marks: [RemoteDrawBoardMark],
+    transform: RemoteDrawBoardTransform? = nil,
+    opacity: Double = 1,
+    contentPixelScale: Double = 1
+  ) {
     self.marks = marks
     self.transform = transform
+    self.opacity = opacity
+    self.contentPixelScale = contentPixelScale.isFinite && contentPixelScale > 0 ? contentPixelScale : 1
   }
 }
 
@@ -109,6 +136,7 @@ public struct RemoteDrawBoardCanvas: View {
   /// first dry stroke on a fresh board paints unmasked and stays that way
   /// until something else happens to invalidate the view — the exact failure
   /// mode the recorded tooth-mask incident produced, only slower.
+  @StateObject private var imageStore = RemoteDrawBoardImageStore()
   @ObservedObject private var groundCache = RemoteDrawGroundCache.shared
 
   /// - Parameter surface: the render axis — which tooth, which instrument
@@ -138,48 +166,112 @@ public struct RemoteDrawBoardCanvas: View {
   }
 
   public var body: some View {
-    Canvas(rendersAsynchronously: false) { context, size in
-      paintGround(&context, size: size)
-      paintGuide(&context, size: size)
-      let defaults = appearance.painterDefaults
-      for section in sections {
-        var target = context
-        if let transform = section.transform {
-          target.translateBy(x: transform.translation.width, y: transform.translation.height)
-          if transform.scale != 1 {
-            target.translateBy(x: transform.pivot.x, y: transform.pivot.y)
-            target.scaleBy(x: transform.scale, y: transform.scale)
-            target.translateBy(x: -transform.pivot.x, y: -transform.pivot.y)
-          }
+    GeometryReader { geometry in
+      let imageMarks = visibleImages(size: geometry.size)
+      let requests = Array(Set(imageMarks.compactMap { imageRequest($0.mark, size: geometry.size, scale: $0.transform?.scale ?? 1) }))
+        .sorted { $0.url == $1.url ? $0.maxPixelSize < $1.maxPixelSize : $0.url < $1.url }
+      Canvas(rendersAsynchronously: false) { context, size in
+        paintGround(&context, size: size)
+        paintGuide(&context, size: size)
+        // Assets stay local and below ink, including over MapKit/host backgrounds.
+        for entry in imageMarks {
+          var target = context
+          apply(entry.transform, to: &target)
+          paintImage(entry.mark, in: &target, size: size, scale: entry.transform?.scale ?? 1)
         }
-        RemoteDrawInkComposer.draw(
-          section.marks,
-          in: &target,
-          size: size,
-          surface: surface,
-          film: {
-            RemoteDrawInkComposer.film(
-              forType: $0.type, pointCount: $0.points.count, style: $0.style, surface: surface)
-          },
-          paint: { mark, layer in
-            RemoteDrawStrokePainter.draw(
-              RemoteDrawStrokePainter.Stroke(
-                points: mark.points, type: mark.type, text: mark.text, style: mark.style),
-              in: &layer,
-              size: size,
-              defaults: mark.lineWidth.map {
-                RemoteDrawStrokePainter.Defaults(
-                  color: defaults.color, lineWidth: $0,
-                  highlighterColor: defaults.highlighterColor)
-              } ?? defaults,
-              surface: surface
-            )
+        let defaults = appearance.painterDefaults
+        for section in sections {
+          var target = context
+          if section.opacity < 1 { target.opacity = max(0, section.opacity) }
+          if let transform = section.transform {
+            target.translateBy(x: transform.translation.width, y: transform.translation.height)
+            if transform.scale != 1 {
+              target.translateBy(x: transform.pivot.x, y: transform.pivot.y)
+              target.scaleBy(x: transform.scale, y: transform.scale)
+              target.translateBy(x: -transform.pivot.x, y: -transform.pivot.y)
+            }
           }
-        )
+          let inkScale = section.contentPixelScale
+          target.scaleBy(x: inkScale, y: inkScale)
+          let inkSize = CGSize(width: size.width / inkScale, height: size.height / inkScale)
+          RemoteDrawInkComposer.draw(
+            section.marks.filter { $0.type != "image" },
+            in: &target,
+            size: inkSize,
+            surface: surface,
+            film: {
+              RemoteDrawInkComposer.film(
+                forType: $0.type, pointCount: $0.points.count, style: $0.style, surface: surface)
+            },
+            paint: { mark, layer in
+              RemoteDrawStrokePainter.draw(
+                RemoteDrawStrokePainter.Stroke(
+                  points: mark.points, type: mark.type, text: mark.text, style: mark.style),
+                in: &layer,
+                size: inkSize,
+                defaults: mark.lineWidth.map {
+                  RemoteDrawStrokePainter.Defaults(
+                    color: defaults.color, lineWidth: $0,
+                    highlighterColor: defaults.highlighterColor)
+                } ?? defaults,
+                surface: surface,
+                dynamicsScale: section.dynamicsReferenceExtent.map {
+                  CGSize(width: inkSize.width / $0, height: inkSize.height / $0)
+                } ?? CGSize(width: 1, height: 1)
+              )
+            }
+          )
+        }
+        overlay?(&context, size)
       }
-      overlay?(&context, size)
+      .clipped()
+      .task(id: requests) { await imageStore.load(requests) }
+      .onAppear { ground.prepare() }
     }
-    .onAppear { ground.prepare() }
+
+  }
+
+  private func apply(_ transform: RemoteDrawBoardTransform?, to context: inout GraphicsContext) {
+    guard let transform else { return }
+    context.translateBy(x: transform.translation.width, y: transform.translation.height)
+    context.translateBy(x: transform.pivot.x, y: transform.pivot.y)
+    context.scaleBy(x: transform.scale, y: transform.scale)
+    context.translateBy(x: -transform.pivot.x, y: -transform.pivot.y)
+  }
+
+  private func visibleImages(size: CGSize) -> [(mark: RemoteDrawBoardMark, transform: RemoteDrawBoardTransform?)] {
+    sections.flatMap { section in
+      section.marks.filter { mark in
+        guard mark.type == "image" else { return false }
+        let points = mark.points.map { point -> RemoteDrawNormalizedPoint in
+          guard let t = section.transform else { return point }
+          return .init(x: ((point.x * size.width - t.pivot.x) * t.scale + t.pivot.x + t.translation.width) / max(size.width, 1),
+            y: ((point.y * size.height - t.pivot.y) * t.scale + t.pivot.y + t.translation.height) / max(size.height, 1))
+        }
+        return RemoteDrawImageGeometry.visible(points)
+      }.map { (mark: $0, transform: section.transform) }
+    }
+  }
+
+  private func imageRequest(_ mark: RemoteDrawBoardMark, size: CGSize, scale: Double) -> RemoteDrawImageRequest? {
+    guard let url = mark.imageUrl,
+      let budget = RemoteDrawImageGeometry.pixelBudget(mark.points, size: size, scale: scale)
+    else { return nil }
+    return RemoteDrawImageRequest(url: url, maxPixelSize: budget)
+  }
+
+  private func paintImage(_ mark: RemoteDrawBoardMark, in context: inout GraphicsContext, size: CGSize, scale: Double) {
+    guard let placement = RemoteDrawImageGeometry.placement(mark.points, size: size) else { return }
+    context.concatenate(placement)
+    let rect = CGRect(x: 0, y: 0, width: 1, height: 1)
+    if let request = imageRequest(mark, size: size, scale: scale), let pixels = imageStore.images[request] {
+      context.draw(Image(decorative: pixels, scale: 1), in: rect)
+    } else {
+      let request = imageRequest(mark, size: size, scale: scale)
+      let failed = request == nil || request.map { imageStore.failures.contains($0) } == true
+      context.fill(Path(rect), with: .color(Color(white: 0.9)))
+      context.draw(Text(failed ? "Image unavailable" : "Loading image").font(.system(size: 0.07)).foregroundColor(.gray), at: CGPoint(x: 0.5, y: 0.5))
+    }
   }
 
   // MARK: Ground
@@ -265,17 +357,19 @@ extension RemoteDrawBoardMark {
     space: RemoteDrawStrokeSpace,
     lineWidth: CGFloat? = nil
   ) {
+    let source = stroke.type == "image" ? RemoteDrawImageGeometry.corners(stroke.points) : stroke.points
     let points: [RemoteDrawNormalizedPoint]
     if stroke.isBoardSpace {
-      let mapped = stroke.points.compactMap(space.unproject)
+      let mapped = source.compactMap(space.unproject)
+      if stroke.type == "image" && mapped.count != 4 { return nil }
       guard !mapped.isEmpty else { return nil }
       points = mapped
     } else {
-      points = stroke.points
+      points = source
     }
     guard !points.isEmpty else { return nil }
     self.init(
-      id: stroke.id, type: stroke.type, points: points, text: stroke.text,
+      id: stroke.id, type: stroke.type, points: points, text: stroke.text, imageUrl: stroke.imageUrl,
       style: stroke.style, lineWidth: lineWidth)
   }
 }

@@ -173,7 +173,7 @@ final class ForwardCompatibilityTests: XCTestCase {
     // as a bare status code.
     XCTAssertEqual(RemoteDrawSenderRoute.undo.requiredCapability, .undo)
     XCTAssertEqual(RemoteDrawSenderRoute.clear.requiredCapability, .clear)
-    XCTAssertEqual(RemoteDrawSenderRoute.submit.requiredCapability, .submit)
+    XCTAssertNil(RemoteDrawSenderRoute.submit.requiredCapability)
     XCTAssertEqual(RemoteDrawSenderRoute.drawings.requiredCapability, .viewExisting)
     XCTAssertEqual(RemoteDrawSenderRoute.projection.requiredCapability, .moveViewport)
     XCTAssertNil(RemoteDrawSenderRoute.draft.requiredCapability)
@@ -188,7 +188,8 @@ final class ForwardCompatibilityTests: XCTestCase {
       Set(RemoteDrawSenderRoute.allCases.map(\.rawValue)),
       [
         "/v1/join",
-        "/v1/sender/session",
+      "/v1/sender/session",
+      "/v1/sender/sync",
         "/v1/sender/ping",
         "/v1/sender/draft",
         "/v1/sender/commit",

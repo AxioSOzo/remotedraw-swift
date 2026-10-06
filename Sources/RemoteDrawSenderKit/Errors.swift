@@ -80,16 +80,16 @@ public enum RemoteDrawError: LocalizedError, Equatable {
         "A join token starts with rd_join_ and a sender token with rd_send_. Pass the whole string, not a URL."
     case .sessionExpired, .sessionEnded:
       return
-        "Create a new session on your server, then hand this app a fresh token. Do not retry with the old one — it will fail the same way every time."
+        "Create a new session on your server, then hand this app a fresh token. Do not retry with the old one; it will fail the same way every time."
     case .tokenRejected:
       return
-        "Ask your backend for a new token from POST /v1/sessions/direct-sender. Do not call that endpoint from the app — it requires your API key."
+        "Ask your backend for a new token from POST /v1/sessions/direct-sender. Do not call that endpoint from the app, because it requires your API key."
     case .notPermitted(let capability):
       return
         "Add '\(capability.rawValue)' to the capabilities when you create the session on your server, or hide the control that calls it."
     case .rateLimited:
       return
-        "Wait the interval, then retry once. If the bucket is auth_failures_per_ip the token is wrong, not the pace — fix the token instead."
+        "Wait the interval, then retry once. If the bucket is auth_failures_per_ip the token is wrong, not the pace. Fix the token instead."
     case .offline:
       return "Check the device's connection. The SDK retries idempotent requests three times on its own before reporting this."
     case .sdkTooOld:
@@ -147,8 +147,8 @@ public enum RemoteDrawError: LocalizedError, Equatable {
     switch self {
     case .offline, .transport:
       return true
-    case .rateLimited:
-      return true
+    case .rateLimited(_, let bucket):
+      return bucket != "auth_failures_per_ip"
     case .server(let status, _, _):
       return status == 408 || status == 429 || status >= 500
     default:
@@ -164,13 +164,14 @@ public enum RemoteDrawError: LocalizedError, Equatable {
 /// lost to a flaky mobile radio can be resent rather than silently vanishing
 /// from a board the sender has already erased it from.
 ///
-/// Three attempts, linear 120 ms — the same shape as `retryIdempotentRequest`
-/// in `packages/client/src/strokeTransport.ts`. Only transport-level failures
+/// Three attempts with linear backoff. Rate limits honor Retry-After plus
+/// positive jitter so devices do not retry together. Only transport-level failures
 /// and server transients retry; a rejection the server reasoned about comes
 /// straight back.
 public func retryIdempotentRequest<T>(
   attempts: Int = 3,
   delay: TimeInterval = 0.12,
+  jitter: @Sendable () -> Double = { Double.random(in: 0...1) },
   sleep: @Sendable (TimeInterval) async throws -> Void = { try await Task.sleep(nanoseconds: UInt64($0 * 1_000_000_000)) },
   _ run: () async throws -> T
 ) async throws -> T {
@@ -183,7 +184,13 @@ public func retryIdempotentRequest<T>(
       lastError = error
       let retriable = (error as? RemoteDrawError)?.isRetriable ?? false
       if attempt >= total || !retriable { throw error }
-      try await sleep(delay * Double(attempt))
+      var wait = max(0, delay) * Double(attempt)
+      if case .rateLimited(let retryAfter, _) = error as? RemoteDrawError {
+        let requested = retryAfter.isFinite ? max(0, retryAfter) : 0
+        wait = max(wait, requested) + max(0, min(1, jitter())) * 0.25
+      }
+      try Task.checkCancellation()
+      try await sleep(wait)
     }
   }
   throw lastError ?? RemoteDrawError.transport("Request failed with no error.")

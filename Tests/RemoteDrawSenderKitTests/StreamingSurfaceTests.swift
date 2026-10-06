@@ -15,6 +15,16 @@ final class StreamingSurfaceTests: XCTestCase {
     try JSONDecoder().decode(RemoteDrawSession.self, from: Data(json.utf8))
   }
 
+  func testExplicitNativeModeWinsOverOptionalPixelAvailability() throws {
+    for kind in ["whiteboard", "map", "custom"] {
+      let session = try decode("""
+        {"id":"s","target":{"kind":"\(kind)"},"senderIntegrationMode":"native",
+         "visualContext":{"enabled":true}}
+        """)
+      XCTAssertFalse(session.requestsStreaming, "Explicit native \(kind) must not be redirected")
+    }
+  }
+
   func testASessionDecodesTheFieldsTheSenderPayloadActuallyCarries() throws {
     // Every key here is one `publicSessionForSender` emits
     // (`convex/lib/senderActivation.ts`).

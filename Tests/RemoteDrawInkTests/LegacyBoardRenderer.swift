@@ -85,7 +85,6 @@ struct LegacyBoardRenderer {
     paint: (Item, inout GraphicsContext) -> Void
   ) {
     let extent = max(size.width, size.height)
-    let field = RemoteDrawInk.toothImage(for: boardDrawingSurface, extent: extent)
     let sheet = CGRect(origin: .zero, size: CGSize(width: extent, height: extent))
     var index = 0
     while index < items.count {
@@ -100,7 +99,12 @@ struct LegacyBoardRenderer {
       // built yet — an uncapped run is the mark this renderer drew before the
       // ceiling existed, where a dropped run would not be.
       var capped: (floor: Double, scale: Double, field: CGImage)?
-      if let capacity = film?.capacity, let field, extent > 0 {
+      // Material capacity is an optical field distinct from physical tooth.
+      // Keep the legacy render oracle on the same established material mode.
+      if let capacity = film?.capacity, extent > 0,
+        let field = RemoteDrawInk.capacityImage(
+          for: boardDrawingSurface, extent: extent, texture: capacity.texture)
+      {
         let floor = min(1, max(0, capacity.floor))
         capped = (
           floor: floor,
@@ -270,9 +274,8 @@ struct LegacyBoardRenderer {
           context.fill(loop, with: .color(fillColor))
         }
       } else if isFreehand, isClosedLoop(screenPoints) {
-        var loop = InkRenderer.smoothPath(through: screenPoints)
-        loop.closeSubpath()
-        context.fill(loop, with: .color(fillColor))
+        // 2026-09-23: a closed outline's wash is its wrapped curve — moved with StrokePainter.
+        context.fill(washPath(screenPoints, size: size), with: .color(fillColor))
       }
     }
 
@@ -336,48 +339,74 @@ struct LegacyBoardRenderer {
        let outline = outlines.first {
       let screenPoints = outline.map { scaled($0, in: size) }
       if screenPoints.count >= 3 {
-        var loop = Path()
-        loop.move(to: screenPoints[0])
-        for point in screenPoints.dropFirst() {
-          loop.addLine(to: point)
-        }
-        loop.closeSubpath()
-        context.fill(loop, with: .color(fillColor))
+        // 2026-09-23: a closed outline's wash is its wrapped curve — moved with StrokePainter.
+        context.fill(washPath(screenPoints, size: size), with: .color(fillColor))
       }
     }
 
-    var painted = false
     let isFlatNib = kindOf(style) == .highlighter || kindOf(style) == .chalk
-    for outline in outlines {
-      let screenPoints = outline.map { scaled($0, in: size) }
-      guard screenPoints.count >= 2 else { continue }
-      if drawFreehandMark(
-        points: outline,
-        screenPoints: screenPoints,
-        style: style,
-        baseColor: resolvedBaseColor(for: style, fallback: color),
-        strokeOpacity: resolvedOpacity(for: style),
-        lineWidth: lineWidth,
-        size: size,
-        in: &context
-      ) {
-        painted = true
-        continue
-      }
-      // The profile's primitive could not take this geometry: stroke the
-      // outline plainly rather than dropping the mark entirely.
-      context.stroke(
-        InkRenderer.smoothPath(through: screenPoints),
-        with: .color(resolvedColor),
-        style: StrokeStyle(
+    let baseColor = resolvedBaseColor(for: style, fallback: color)
+    func paintOutlines(_ target: inout GraphicsContext, strokeOpacity: Double, plainColor: Color) -> Bool {
+      var painted = false
+      for outline in outlines {
+        let screenPoints = outline.map { scaled($0, in: size) }
+        guard screenPoints.count >= 2 else { continue }
+        if drawFreehandMark(
+          points: outline,
+          screenPoints: screenPoints,
+          style: style,
+          baseColor: baseColor,
+          strokeOpacity: strokeOpacity,
           lineWidth: lineWidth,
-          lineCap: isFlatNib ? .butt : .round,
-          lineJoin: .round
+          size: size,
+          in: &target
+        ) {
+          painted = true
+          continue
+        }
+        // The profile's primitive could not take this geometry: stroke the
+        // outline plainly rather than dropping the mark entirely.
+        target.stroke(
+          InkRenderer.smoothPath(through: screenPoints),
+          with: .color(plainColor),
+          style: StrokeStyle(
+            lineWidth: lineWidth,
+            lineCap: isFlatNib ? .butt : .round,
+            lineJoin: .round
+          )
         )
-      )
-      painted = true
+        painted = true
+      }
+      return painted
     }
-    return painted
+
+    // 2026-09-23: an arrow's outlines composite as one mark — moved with StrokePainter.
+    let opacity = resolvedOpacity(for: style)
+    let profile = RemoteDrawInk.profile(for: kindOf(style), surface: boardDrawingSurface)
+    let singlePath =
+      profile.grain == nil && profile.scatter == nil && profile.glow == nil
+      && profile.tooth == nil
+    if outlines.count > 1, opacity < 1, profile.multiply || profile.flatten || singlePath {
+      var painted = false
+      var group = context
+      group.opacity *= opacity
+      group.drawLayer { layer in
+        layer.opacity = 1
+        painted = paintOutlines(&layer, strokeOpacity: 1, plainColor: baseColor)
+      }
+      return painted
+    }
+    return paintOutlines(&context, strokeOpacity: opacity, plainColor: resolvedColor)
+  }
+
+  /// 2026-09-23: moved with StrokePainter's `washPath`.
+  private func washPath(_ screenPoints: [CGPoint], size: CGSize) -> Path {
+    if InkRenderer.isClosedOutline(screenPoints, extent: max(size.width, size.height)) {
+      return InkRenderer.closedSmoothPath(through: Array(screenPoints.dropLast()))
+    }
+    var loop = InkRenderer.smoothPath(through: screenPoints)
+    loop.closeSubpath()
+    return loop
   }
 
   /// Paints one freehand mark from its instrument profile. Returns false when
@@ -434,6 +463,12 @@ struct LegacyBoardRenderer {
       lineWidth: lineWidth,
       surfaceExtent: surfaceExtent
     )
+    // 2026-09-23: a shape's closed outline has no ends — moved with StrokePainter.
+    let closed = InkRenderer.isClosedOutline(screenPoints, extent: surfaceExtent)
+    let centerline =
+      closed
+      ? InkRenderer.closedSmoothPath(through: Array(screenPoints.dropLast()))
+      : InkRenderer.smoothPath(through: screenPoints)
 
     // A flattened stroke paints opaque into an isolated layer that carries the
     // alpha, so self-overlap does not double in density; multiply makes a pass
@@ -441,7 +476,7 @@ struct LegacyBoardRenderer {
     let paint: (inout GraphicsContext) -> Bool = { layer in
       if let glow = profile.glow {
         layer.stroke(
-          InkRenderer.smoothPath(through: screenPoints),
+          centerline,
           with: .color(markColor.opacity(glow.opacity)),
           style: StrokeStyle(lineWidth: lineWidth * glow.width, lineCap: .round, lineJoin: .round)
         )
@@ -462,7 +497,8 @@ struct LegacyBoardRenderer {
         guard let streaks = InkRenderer.grainStreaks(
           centerline: screenPoints,
           widths: widths ?? [lineWidth],
-          grain: grain
+          grain: grain,
+          closed: closed  // 2026-09-23: grain runs round a closed outline — moved with StrokePainter.
         ) else { return false }
         for streak in streaks {
           layer.stroke(
@@ -479,10 +515,18 @@ struct LegacyBoardRenderer {
         return true
       }
 
-      if let widths, let ribbon = InkRenderer.ribbonPath(
-        centerline: screenPoints,
-        halfWidths: widths.map { max($0 / 2, lineWidth * 0.04) }
-      ) {
+      // 2026-09-23: short dashes are capsules — moved with StrokePainter.
+      let capsule =
+        axisFactors == nil && InkRenderer.isShortStroke(screenPoints, lineWidth: lineWidth)
+      let halfWidths = widths?.map { max($0 / 2, lineWidth * 0.04) }
+      if let halfWidths, !capsule, let ribbon = closed
+        ? InkRenderer.closedRibbonPath(centerline: screenPoints, halfWidths: halfWidths)
+        : InkRenderer.ribbonPath(
+          centerline: screenPoints,
+          halfWidths: halfWidths,
+          flatNib: profile.flatNib,
+          allowShortAxis: axisFactors != nil
+        ) {
         layer.fill(ribbon, with: .color(markColor))
         return true
       }
@@ -490,7 +534,7 @@ struct LegacyBoardRenderer {
       // Uniform instruments, and the fallback when a ribbon degenerates.
       guard screenPoints.count >= 2 else { return false }
       layer.stroke(
-        InkRenderer.smoothPath(through: screenPoints),
+        centerline,
         with: .color(markColor),
         style: StrokeStyle(
           lineWidth: lineWidth,
@@ -569,7 +613,8 @@ struct LegacyBoardRenderer {
       return nil
     }
     guard factors.count == screenPoints.count else { return nil }
-    let tapers = profile.taper.map {
+    let closed = InkRenderer.isClosedOutline(screenPoints, extent: surfaceExtent)
+    let tapers = (closed ? nil : profile.taper).map {
       // The stroke width goes with it: each end's length is capped in nib
       // widths, which is what keeps an instrument the same shape at every
       // width. Mirrors `perPointStrokeWidths` on the web.
